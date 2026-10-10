@@ -213,6 +213,27 @@ cargo build --release -p oag-node
     --datadir ./oag-data --out ./block
 ```
 
+### Community pools
+
+These are independently operated services, not official Orange infrastructure.
+A listing does not imply endorsement. Pool operators hold mining rewards until
+payout; check the operator's current terms and availability before connecting.
+
+| Pool | Mainnet endpoint | Fee / payout method | Minimum payout | Status |
+| --- | --- | --- | --- | --- |
+| [Orange Pool](https://orange.gen.nz/) | `mine.orange.gen.nz:1920` | 1% / PPLNS | 1 OAG | Early, home-hosted service; no uptime guarantee |
+
+Orange Pool publishes [pool statistics and payout transaction links](https://orange.gen.nz/#pool).
+Use an [OAG-compatible XMRig build](https://github.com/manh923/xmrig-for-oag)
+that supports `rx/oag`, with your own mainnet receiving address:
+
+```sh
+./xmrig -a rx/oag -o mine.orange.gen.nz:1920 -u YOUR_OAG_ADDRESS
+```
+
+Mining requires only your public receiving address. Never give a pool your
+recovery phrase or private key.
+
 ### Reading the log
 
 Each line is tagged with what it is about. **"Carried it here" and "checked it
