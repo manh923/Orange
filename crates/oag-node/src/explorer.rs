@@ -85,9 +85,13 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(pair) => pair,
+                // **止めない。** ファイル記述子が尽きたときなどに 1 度失敗した
+                // だけで、ノードを再起動するまで頁も API も返らなくなっていた。
+                // P2P の待ち受けと同じく、少し待ってからやり直す。
                 Err(e) => {
-                    crate::log_warn!("cannot accept an explorer connection: {e}");
-                    return;
+                    crate::log_warn!("cannot accept an explorer connection: {e} (trying again)");
+                    tokio::time::sleep(crate::ACCEPT_RETRY).await;
+                    continue;
                 }
             };
             let shared = shared.clone();
@@ -102,7 +106,19 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
 /// 応答 1 個。
 struct Response {
     status: &'static str,
+    /// `Content-Type`。
+    kind: Kind,
     body: String,
+}
+
+/// 応答の中身の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Html,
+    /// `/api/…`。外の集計サイトがブラウザから読めるように、どこからの
+    /// 読み出しも許す (`Access-Control-Allow-Origin: *`)。読むだけの
+    /// 公開の数字なので、許して困るものは無い。
+    Json,
 }
 
 async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
@@ -118,6 +134,7 @@ async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> std::io
                 &mut stream,
                 &Response {
                     status: "400 Bad Request",
+                    kind: Kind::Html,
                     body,
                 },
             )
@@ -162,9 +179,14 @@ pub(crate) async fn read_target(stream: &mut TcpStream, buffer: &mut Vec<u8>) ->
 }
 
 async fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
+    let (kind, origin) = match response.kind {
+        Kind::Html => ("text/html; charset=utf-8", ""),
+        Kind::Json => ("application/json", "Access-Control-Allow-Origin: *\r\n"),
+    };
     let head = format!(
         "HTTP/1.1 {}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Type: {kind}\r\n\
+         {origin}\
          Content-Length: {}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\n\
@@ -199,6 +221,8 @@ async fn route(shared: &Shared, target: &str) -> Response {
         ["address", rest @ ..] => address_page(handle, &rest.join("/"), query).await,
         ["mempool"] => mempool_page(handle).await,
         ["peers"] => peers_page(handle).await,
+        ["api", "stats"] => api_stats(shared).await,
+        ["api", ..] => json_error("404 Not Found", "no such endpoint"),
         _ => not_found("no such page"),
     }
 }
@@ -316,11 +340,8 @@ async fn stats_page(shared: &Shared) -> Response {
     body.push_str(&search_box(""));
     body.push_str("<h1>statistics</h1>");
 
-    let rate = |blocks| {
-        tally
-            .hashrate(blocks)
-            .map_or_else(|| "—".to_string(), stats::format_hashrate)
-    };
+    let summary = stats::summary(&tally, &status);
+    let rate = |rate: Option<f64>| rate.map_or_else(|| "—".to_string(), stats::format_hashrate);
     let running = match tally.first_time() {
         Some(first) => {
             let now = std::time::SystemTime::now()
@@ -334,28 +355,31 @@ async fn stats_page(shared: &Shared) -> Response {
 
     body.push_str("<h2>chain</h2><div class=\"grid\">");
     stat(&mut body, "running", &running);
-    stat(&mut body, "blocks", &group(status.height));
+    stat(&mut body, "blocks", &group(summary.height));
     stat(
         &mut body,
         "average block time",
-        &tally
-            .average_interval()
+        &summary
+            .average_block_time
             .map_or_else(|| "—".to_string(), |s| format!("{s:.1} s")),
     );
-    stat(&mut body, "hashrate (1 h)", &rate(stats::SHORT_WINDOW));
-    stat(&mut body, "hashrate (24 h)", &rate(stats::LONG_WINDOW));
-    stat(&mut body, "next difficulty", &group(status.next_difficulty));
+    stat(&mut body, "hashrate (1 h)", &rate(summary.hashrate));
+    stat(&mut body, "hashrate (24 h)", &rate(summary.hashrate_24h));
+    stat(&mut body, "next difficulty", &group(summary.difficulty));
     // コミットメント出力などのソフトフォーク (SPEC §10.9)。数えている間は、
     // 今の区切りで印の付いたブロックの数も出す。
-    let softfork = &status.softfork;
-    let label = match (softfork.deployment, softfork.signals) {
-        (Some(d), Some((count, elapsed))) if softfork.state.should_signal() => format!(
-            "{} — {count} of {elapsed} signalled (needs {} of {})",
-            softfork.state.name(),
-            d.threshold,
-            d.period
+    let softfork = &summary.softfork;
+    let label = match (
+        softfork.signalled,
+        softfork.elapsed,
+        softfork.threshold,
+        softfork.period,
+    ) {
+        (Some(count), Some(elapsed), Some(threshold), Some(period)) => format!(
+            "{} — {count} of {elapsed} signalled (needs {threshold} of {period})",
+            softfork.state
         ),
-        _ => softfork.state.name().to_string(),
+        _ => softfork.state.to_string(),
     };
     stat(&mut body, "soft fork (commitments)", &esc(&label));
     body.push_str("</div>");
@@ -548,6 +572,26 @@ async fn stats_page(shared: &Shared) -> Response {
     );
 
     ok(page("statistics", &body))
+}
+
+/// `GET /api/stats`。`/stats` の「chain」の欄と同じ数字を JSON で返す。
+///
+/// 外の集計サイト (採掘の収益計算など) が読むためのもの。中身と名前は
+/// [`stats::Summary`] と `docs/COMMANDS.md` にある。
+async fn api_stats(shared: &Shared) -> Response {
+    let handle = &shared.handle;
+    let status = match handle.status().await {
+        Ok(status) => status,
+        Err(e) => return json_error("503 Service Unavailable", &e),
+    };
+    let mut tally = shared.tally.lock().await;
+    if let Err(e) = stats::catch_up(&mut tally, handle).await {
+        return json_error("503 Service Unavailable", &e);
+    }
+    match serde_json::to_string(&stats::summary(&tally, &status)) {
+        Ok(body) => json_ok(body),
+        Err(e) => json_error("500 Internal Server Error", &e.to_string()),
+    }
 }
 
 /// 直近のブロックを誰が掘ったか。
@@ -1622,6 +1666,7 @@ fn row_raw(out: &mut String, label: &str, value: &str) {
 fn ok(body: String) -> Response {
     Response {
         status: "200 OK",
+        kind: Kind::Html,
         body,
     }
 }
@@ -1629,6 +1674,7 @@ fn ok(body: String) -> Response {
 fn not_found(message: &str) -> Response {
     Response {
         status: "404 Not Found",
+        kind: Kind::Html,
         body: page(
             "not found",
             &format!(
@@ -1643,10 +1689,29 @@ fn not_found(message: &str) -> Response {
 fn error_page(message: &str) -> Response {
     Response {
         status: "500 Internal Server Error",
+        kind: Kind::Html,
         body: page(
             "error",
             &format!("{}<h1>error</h1><p>{}</p>", search_box(""), esc(message)),
         ),
+    }
+}
+
+/// JSON の応答。
+fn json_ok(body: String) -> Response {
+    Response {
+        status: "200 OK",
+        kind: Kind::Json,
+        body,
+    }
+}
+
+/// JSON の誤り。`{"error": "…"}` の形で返す。
+fn json_error(status: &'static str, message: &str) -> Response {
+    Response {
+        status,
+        kind: Kind::Json,
+        body: serde_json::json!({ "error": message }).to_string(),
     }
 }
 

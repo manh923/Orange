@@ -255,6 +255,47 @@ oag-node info --network mainnet          # 残高が出る
 渡らない。ループバック以外に開くときは証明書が要る。平文で配ったページは
 差し替えられ、差し替えられたページは鍵をそのまま持っていく。
 
+#### エクスプローラの JSON (`/api/stats`)
+
+0.5.1 から。外の集計サイトに渡すための口で、`/stats` の「chain」の欄と同じ
+数字を返す。読むだけで、`GET` (と `HEAD`) しか受けない。
+
+```sh
+curl -s http://127.0.0.1:8080/api/stats
+```
+
+```json
+{"network":"mainnet","height":41792,"difficulty":1341696,
+ "hashrate":22380.4,"hashrate_24h":47500.2,"average_block_time":61.0,
+ "block_reward":"10","supply":"417920",
+ "last_block":{"height":41792,"hash":"8371…cb11","time":1792193706},
+ "softfork":{"state":"started","signalled":6,"elapsed":33,"threshold":960,"period":1440}}
+```
+
+| 名前 | 単位 | 中身 |
+| --- | --- | --- |
+| `network` | | `mainnet` / `testnet` / `regtest` |
+| `height` | ブロック | 先端の高さ |
+| `difficulty` | ハッシュ | 次のブロックの難易度。1 ブロックに要るハッシュ数の期待値 |
+| `hashrate` | H/s | 直近 60 ブロック (約 1 時間) から出した**実測**の値 |
+| `hashrate_24h` | H/s | 直近 1,440 ブロック (約 1 日) から出した実測の値 |
+| `average_block_time` | 秒 | ブロック 1 から先端までの平均の間隔 |
+| `block_reward` | OAG (文字列) | 次のブロックの報酬 |
+| `supply` | OAG (文字列) | 使われていない出力にある OAG の合計。焼却されたジェネシスの報酬は入らない |
+| `last_block` | | 先端の `height`、`hash` (16 進)、`time` (Unix 秒、ヘッダの時刻) |
+| `softfork` | | `state`、`signalled`、`elapsed`、`threshold`、`period`。意味は RPC の `getinfo` の `softfork` と同じ |
+
+- **名前と単位は変えない。** 足すことはあっても、今ある名前を変えたり消したり
+  はしない。読んでいる集計サイトが壊れるため。
+- 測れない値は `null` になる (ブロックが足りないときのハッシュレート、
+  ジェネシスしか無いときの `last_block`、数えていない間の `signalled` など)。
+- 金額は OAG の十進の文字列である。最小単位 (10^-16 OAG) の数は大きすぎて、
+  JSON の数値では正確に運べない。
+- プールの `/api/stats` (`--pool`) の `hashrate` は「次の難易度 ÷ 60 秒」の
+  見積もりで、こちらの実測とはずれる。外に渡すのはこちらにする。
+- どこからでも読める (`Access-Control-Allow-Origin: *`)。知らない
+  `/api/…` には `{"error": "…"}` で答える。
+
 ### run — RPC ほか
 
 | | すること |

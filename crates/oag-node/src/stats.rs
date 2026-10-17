@@ -1,4 +1,5 @@
-//! 鎖の統計。エクスプローラの `/stats` と `/richlist` が出す数字を数える。
+//! 鎖の統計。エクスプローラの `/stats` と `/richlist`、`/api/stats` が出す
+//! 数字を数える。
 //!
 //! # 何を数えるか
 //!
@@ -33,12 +34,15 @@
 //! 覚えた先端が鎖から外れていたら (再編成)、最初から数え直す。
 //! 滅多に起きず、起きても数秒で済む。
 
+use crate::node::NodeStatus;
 use crate::service::NodeHandle;
 use oag_consensus::codec::Encode;
 use oag_consensus::lock::Lock;
+use oag_consensus::params::block_subsidy;
 use oag_consensus::tx::OutPoint;
 use oag_consensus::Block;
-use oag_primitives::Hash;
+use oag_primitives::{Amount, Hash};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 「直近」とみなす期間 (秒)。
@@ -504,6 +508,99 @@ pub async fn catch_up(tally: &mut Tally, handle: &NodeHandle) -> Result<(), Stri
         tally.add(&block, hash);
     }
     Ok(())
+}
+
+/// 鎖の今の姿。エクスプローラの `/api/stats` がそのまま JSON にして返し、
+/// `/stats` の「chain」の欄も同じ値を出す。**計算はここだけに置く。**
+/// 頁と JSON が別々に数えると、そのうち食い違う。
+///
+/// **名前と単位は一度出したら変えない** (`docs/COMMANDS.md`)。外の集計
+/// サイトが読みに来るので、変えるとそちらが壊れる。足すのは構わない。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Summary {
+    /// `mainnet` / `testnet` / `regtest`。
+    pub network: String,
+    /// 先端の高さ。
+    pub height: u64,
+    /// 次のブロックの難易度 (= 1 ブロックに要るハッシュ数の期待値)。
+    pub difficulty: u64,
+    /// 直近 [`SHORT_WINDOW`] ブロックから出した実測のハッシュレート (H/s)。
+    pub hashrate: Option<f64>,
+    /// 直近 [`LONG_WINDOW`] ブロックから出した実測のハッシュレート (H/s)。
+    pub hashrate_24h: Option<f64>,
+    /// ブロック 1 から先端までの平均の間隔 (秒)。
+    pub average_block_time: Option<f64>,
+    /// 次のブロックの報酬 (OAG、十進の文字列)。
+    pub block_reward: String,
+    /// 使われていない出力にある OAG の合計 (十進の文字列)。ジェネシスの
+    /// 報酬 (焼却) とコミットメント出力 (金額 0) は入らない。
+    pub supply: String,
+    /// 数え終えた先端のブロック。ジェネシスしか無ければ `None`。
+    pub last_block: Option<LastBlock>,
+    /// コミットメント出力などのソフトフォーク (SPEC §10.9)。
+    pub softfork: SoftForkSummary,
+}
+
+/// [`Summary::last_block`]。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LastBlock {
+    /// 高さ。
+    pub height: u64,
+    /// ブロックハッシュ (16 進)。
+    pub hash: String,
+    /// Unix 秒 (ブロックのヘッダの時刻)。
+    pub time: i64,
+}
+
+/// [`Summary::softfork`]。名前は RPC の `getinfo` の `softfork` に合わせる。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SoftForkSummary {
+    /// `defined` / `started` / `locked_in` / `active` / `failed`。
+    pub state: &'static str,
+    /// いまの区切りで印の付いたブロックの数。数えていなければ `None`。
+    pub signalled: Option<u64>,
+    /// いまの区切りに積まれたブロックの数。
+    pub elapsed: Option<u64>,
+    /// 閾値。最初から有効なネットワークでは `None`。
+    pub threshold: Option<u64>,
+    /// 区切りの長さ。
+    pub period: Option<u64>,
+}
+
+/// ノードの状態と、数え終えた集計から [`Summary`] を作る。
+pub fn summary(tally: &Tally, status: &NodeStatus) -> Summary {
+    let softfork = &status.softfork;
+    let (signalled, elapsed) = match softfork.signals {
+        Some((count, elapsed)) if softfork.state.should_signal() => (Some(count), Some(elapsed)),
+        _ => (None, None),
+    };
+    let last_block = match tally.tip {
+        Some((height, hash)) if height > 0 => Some(LastBlock {
+            height,
+            hash: hash.to_string(),
+            time: tally.tip_time,
+        }),
+        _ => None,
+    };
+    let supply = tally.holdings().supply;
+    Summary {
+        network: status.network.to_string(),
+        height: status.height,
+        difficulty: status.next_difficulty,
+        hashrate: tally.hashrate(SHORT_WINDOW),
+        hashrate_24h: tally.hashrate(LONG_WINDOW),
+        average_block_time: tally.average_interval(),
+        block_reward: block_subsidy(status.height.saturating_add(1)).to_string(),
+        supply: Amount::from_atomic(supply).map_or_else(|_| supply.to_string(), |a| a.to_string()),
+        last_block,
+        softfork: SoftForkSummary {
+            state: softfork.state.name(),
+            signalled,
+            elapsed,
+            threshold: softfork.deployment.map(|d| d.threshold),
+            period: softfork.deployment.map(|d| d.period),
+        },
+    }
 }
 
 /// ハッシュレートを読みやすい単位にする。

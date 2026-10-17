@@ -60,7 +60,7 @@ pub const MAX_INBOUND: usize = 117;
 pub const MAX_INBOUND_PER_IP: usize = 4;
 
 /// 受け入れに失敗したときに、次を待つまでの間。
-const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+pub(crate) const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 /// 受け入れた接続の数。
 #[derive(Clone, Default)]

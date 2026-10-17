@@ -450,6 +450,11 @@ read-only** — you cannot send coins or change settings from it.
 Pass an address to move it: `--explorer 127.0.0.1:9000`. Binding to anything
 other than loopback makes it reachable from outside.
 
+`/api/stats` returns the chain numbers from the stats page (height, difficulty,
+measured hashrate, average block time, block reward, supply, the last block and
+the soft-fork state) as JSON, for aggregator sites. The field names and units
+are listed in [docs/COMMANDS.md](docs/COMMANDS.md) and will not be renamed.
+
 ### What keeps it cheap as blocks fill up
 
 The front page **does not read the bodies** of the 25 blocks it lists. Time and

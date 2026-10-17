@@ -375,3 +375,99 @@ fn connected_peers_are_listed_with_their_addresses_cut_down() {
         );
     });
 }
+
+/// 1 要求出して、頭 (状態行とヘッダ) と本文を返す。
+async fn get_with_head(addr: std::net::SocketAddr, target: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("it connects");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("it can send");
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("a response arrives")
+        .expect("readable");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .expect("headers and body are separated");
+    (head.to_string(), body.to_string())
+}
+
+/// `/api/stats` が、名前を決めた JSON を返すこと。
+///
+/// **名前は外の集計サイトが読む。** ここで全部の名前を確かめておけば、
+/// うっかり変えたときに試験が落ちる (docs/COMMANDS.md)。
+#[test]
+fn the_stats_api_answers_in_json_with_the_documented_names() {
+    let (_dir, service, runtime, addr) = start("api");
+    let (head, body) = runtime.block_on(get_with_head(addr, "/api/stats"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    let keys: Vec<&str> = json
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for name in [
+        "network",
+        "height",
+        "difficulty",
+        "hashrate",
+        "hashrate_24h",
+        "average_block_time",
+        "block_reward",
+        "supply",
+        "last_block",
+        "softfork",
+    ] {
+        assert!(keys.contains(&name), "{name} is missing from {body}");
+    }
+    for name in ["state", "signalled", "elapsed", "threshold", "period"] {
+        assert!(
+            json["softfork"].get(name).is_some(),
+            "softfork.{name} is missing from {body}"
+        );
+    }
+
+    // ジェネシスだけの鎖。ジェネシスは数えないので、測れないものは null。
+    assert_eq!(json["network"], "mainnet");
+    assert_eq!(json["height"], 0);
+    assert!(json["difficulty"].as_u64().unwrap() > 0);
+    assert!(json["hashrate"].is_null());
+    assert!(json["last_block"].is_null());
+    assert_eq!(json["block_reward"], "10");
+    assert_eq!(json["supply"], "0");
+    assert_eq!(json["softfork"]["period"], 1440);
+    assert_eq!(json["softfork"]["threshold"], 960);
+    drop(service);
+}
+
+/// 頁の「chain」の欄も同じ数字から作られ、今まで通り出ること。
+#[test]
+fn the_stats_page_still_renders() {
+    let (_dir, service, runtime, addr) = start("statspage");
+    let (status, body) = runtime.block_on(get(addr, "/stats"));
+    assert!(status.contains("200"), "{status}");
+    assert!(body.contains("hashrate (24 h)"));
+    assert!(body.contains("soft fork (commitments)"));
+    drop(service);
+}
+
+/// 知らない API は、HTML の頁ではなく JSON の誤りで断る。
+#[test]
+fn an_unknown_api_is_refused_in_json() {
+    let (_dir, service, runtime, addr) = start("api404");
+    let (head, body) = runtime.block_on(get_with_head(addr, "/api/nothing"));
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    assert!(head.contains("application/json"), "{head}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    assert_eq!(json["error"], "no such endpoint");
+    drop(service);
+}

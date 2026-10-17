@@ -2839,7 +2839,7 @@ separate interface means loosening one does not loosen the other.
 
 - Verbs `GET` and `HEAD` only; everything else is refused
 - Paths `/`, `/block/<height|hash>`, `/tx/<txid>`, `/address/<address>`,
-  `/mempool`, `/stats`, `/richlist`, `/peers`, `/search?q=`
+  `/mempool`, `/stats`, `/richlist`, `/peers`, `/search?q=`, `/api/stats`
 - Request headers up to 8 KB; one request per connection
 
 **Both paths and queries are strings the user chooses.** Every value embedded in
@@ -2886,6 +2886,25 @@ and each day's column carries its values in a `<title>`.
   size of the UTXO set itself
 - Timestamps can go backwards. A block that looks like it belongs to an earlier
   date goes into the current day, and a closed day is never reopened
+
+
+#### JSON (`/api/stats`)
+
+An interface for outside aggregators (mining profitability calculators and the
+like). It gives **the same values, from the same calculation,** as the "chain"
+section of `/stats`. The calculation lives in one place so that the page and the
+JSON cannot drift apart. The fields and units are listed in `docs/COMMANDS.md`.
+
+- **Once published, names and units do not change.** Changing them breaks
+  whoever reads them. Adding fields is fine
+- A value that cannot be measured (such as the hashrate when there are too few
+  blocks) is `null`, not 0. A 0 would be read as "nobody is mining"
+- Amounts are decimal strings in OAG. One OAG is 10^16 atomic units, so an
+  atomic count cannot be held exactly in a double-precision number
+  (2^53 ≈ 9 × 10^15)
+- Reads from any origin are allowed (`Access-Control-Allow-Origin: *`). These are
+  public, read-only numbers; there is nothing to protect by refusing
+- An unknown `/api/…` is answered with `{"error": …}`, not an HTML page
 
 #### Peers (`/peers`)
 
