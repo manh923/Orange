@@ -222,13 +222,14 @@ payout; check the operator's current terms and availability before connecting.
 | Pool | Mainnet endpoint | Fee / payout method | Minimum payout | Status |
 | --- | --- | --- | --- | --- |
 | [Orange Pool](https://orange.gen.nz/) | `mine.orange.gen.nz:1920` | 1% / PPLNS | 1 OAG | Early, home-hosted service; no uptime guarantee |
+| [VSLabs Orange Coin Mining Pool](https://oagnode.vslabs.co.in/pool/) | `oagnode.vslabs.co.in:1919` | Free (0%) / PPLNS | 1.0 OAG | No-profit support for OAG, 100% uptime and sync with latest codebase |
 
 Orange Pool publishes [pool statistics and payout transaction links](https://orange.gen.nz/#pool).
 Use an [OAG-compatible XMRig build](https://github.com/manh923/xmrig-for-oag)
 that supports `rx/oag`, with your own mainnet receiving address:
 
 ```sh
-./xmrig -a rx/oag -o mine.orange.gen.nz:1920 -u YOUR_OAG_ADDRESS
+./xmrig -a rx/oag -o ENDPOINT_URL_WITH_PORT -u YOUR_OAG_ADDRESS
 ```
 
 Mining requires only your public receiving address. Never give a pool your
