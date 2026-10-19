@@ -5,6 +5,39 @@
 A CPU-mined UTXO blockchain that uses RandomX for proof of work.
 Inspired by [chroma](https://github.com/kusogakiller/chroma).
 
+## Start mining in 3 steps
+
+1. **Make an address.** Open the [browser wallet](https://wallet.oagcoin.org/),
+   create a wallet, and **write the recovery phrase on paper before anything
+   else.** The keys are made inside your browser and are never sent to the
+   server. Clearing the browser's data for the site deletes the wallet; the
+   phrase is the only way to get it back.
+2. **Get the miner.** Download XMRig for OAG from its
+   [latest release](https://github.com/manh923/xmrig-for-oag/releases/latest)
+   (`xmrig-oag-…-windows-x64.zip` on Windows, `xmrig-oag-…-linux-static-x64.tar.gz`
+   on Linux) and unpack it. Standard XMRig cannot mine OAG.
+3. **Start.** On Windows, run `start.bat` and paste your `oag1…` address when
+   asked. Anywhere else, pick a pool below and run one line:
+
+   ```sh
+   ./xmrig -a rx/oag -o mine.orange.gen.nz:1920 -u YOUR_OAG_ADDRESS
+   ```
+
+| Pool | Endpoint | Fee / method |
+| --- | --- | --- |
+| [Orange Pool](https://orange.gen.nz/) | `mine.orange.gen.nz:1920` | 1% / PPLNS |
+| [VSLabs Orange Coin Mining Pool](https://oagnode.vslabs.co.in/pool/) | `oagnode.vslabs.co.in:1919` | 0% / PPLNS |
+
+Both pools are run independently of the project; see
+[Community pools](#community-pools) before you connect. You can also mine solo
+with your own node ([Mining](#mining)). Mining needs only your public address —
+never give anyone your recovery phrase.
+
+Antivirus software often flags miners, this one included, because the same
+program is abused to mine on other people's computers. Check the file against
+`SHA256SUMS` on the release page, or
+[build it from source](https://github.com/manh923/xmrig-for-oag).
+
 > **Status: mainnet is live.** The genesis block was fixed in September 2026
 > and mining has continued since. Payments, the browser wallet and the block
 > explorer all work.

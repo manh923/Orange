@@ -5,6 +5,39 @@
 RandomX を Proof of Work に用いる、CPU マイニング型の UTXO ブロックチェーン。
 [chroma](https://github.com/kusogakiller/chroma) に着想を得た。
 
+## 3 手順で掘り始める
+
+1. **アドレスを作る。** [ブラウザのウォレット](https://wallet.oagcoin.org/)
+   を開いてウォレットを作り、**何より先に、控えの語を紙に書いてください。**
+   鍵はブラウザの中で作られ、サーバーには送られません。そのサイトの
+   ブラウザのデータを消すとウォレットも消えます。戻せるのは控えの語だけです。
+2. **採掘器を落とす。** OAG 用の XMRig を
+   [最新のリリース](https://github.com/manh923/xmrig-for-oag/releases/latest)
+   から落として展開します (Windows は `xmrig-oag-…-windows-x64.zip`、
+   Linux は `xmrig-oag-…-linux-static-x64.tar.gz`)。素の XMRig では
+   OAG は掘れません。
+3. **始める。** Windows なら `start.bat` を動かし、聞かれたら `oag1…` の
+   アドレスを貼ります。それ以外では、下のプールを 1 つ選んで 1 行です。
+
+   ```sh
+   ./xmrig -a rx/oag -o mine.orange.gen.nz:1920 -u <自分の受取先アドレス>
+   ```
+
+| プール | 接続先 | 手数料 / 払い方 |
+| --- | --- | --- |
+| [Orange Pool](https://orange.gen.nz/) | `mine.orange.gen.nz:1920` | 1% / PPLNS |
+| [VSLabs Orange Coin Mining Pool](https://oagnode.vslabs.co.in/pool/) | `oagnode.vslabs.co.in:1919` | 0% / PPLNS |
+
+どちらも Orange とは別の人が運営しています。繋ぐ前に
+[コミュニティのプール](#コミュニティのプール) を読んでください。自分の
+ノードで掘ること ([掘る](#掘る)) もできます。掘るのに要るのは公開している
+アドレスだけです。控えの語は誰にも渡さないでください。
+
+採掘器は、他人の機械で勝手に掘らせる悪用が多いため、ウイルス対策ソフトに
+止められることがよくあります (これも同じです)。リリースの頁の
+`SHA256SUMS` と照らし合わせるか、
+[ソースから作って](https://github.com/manh923/xmrig-for-oag) ください。
+
 > **状態: mainnet 稼働中。** 2026 年 9 月にジェネシスを確定させ、以後
 > 採掘が続いています。送金・ブラウザのウォレット・エクスプローラまで
 > ひととおり動きます。
@@ -192,6 +225,7 @@ cargo build --release -p oag-node
 | プール | mainnet の接続先 | 手数料 / 払い方 | 最低払い出し額 | 状況 |
 | --- | --- | --- | --- | --- |
 | [Orange Pool](https://orange.gen.nz/) | `mine.orange.gen.nz:1920` | 1% / PPLNS | 1 OAG | 始めたばかりで、自宅で運営。稼働の保証は無し |
+| [VSLabs Orange Coin Mining Pool](https://oagnode.vslabs.co.in/pool/) | `oagnode.vslabs.co.in:1919` | 無料 (0%) / PPLNS | 1.0 OAG | 運営者いわく、利益を取らない支援で、最新のコードに追随 |
 
 Orange Pool は、[プールの統計と払い出しのトランザクションへのリンク](https://orange.gen.nz/#pool)
 を公開しています。`rx/oag` に対応した
