@@ -1036,7 +1036,15 @@ fn show_pst(pst: &Pst, network: Network) -> Result<(), String> {
         } else {
             "**unsigned**"
         };
-        println!("    [{index}] {} OAG  {where_}  {state}", input.utxo.amount);
+        // **sighash type is shown next to the amount.** SIGHASH_NONE / SINGLE /
+        // ANYONECANPAY do not commit to (all) outputs, so signing one of them is
+        // not the same promise as the default type.
+        let sighash = if input.sighash.is_default() {
+            "default".to_string()
+        } else {
+            format!("0x{:02x}", input.sighash.to_byte())
+        };
+        println!("    [{index}] {} OAG  {where_}  sighash {sighash}  {state}", input.utxo.amount);
     }
     println!("  outputs        {}", tx.outputs.len());
     for (index, output) in tx.outputs.iter().enumerate() {
@@ -1109,6 +1117,26 @@ async fn pst(common: &Common, network: Network, action: PstCommand) -> Result<()
             // **署名する前に中身を見せる。** 何に署名するのかを知らずに
             // 署名させてはならない。
             show_pst(&pst, network)?;
+            // **Refuse to sign a PST that selects a non-default sighash type.**
+            // SIGHASH_NONE / SINGLE / ANYONECANPAY stay valid if another party
+            // rewrites the outputs, so signing one at the request of a counterparty
+            // hands over the funds it signs for (audit finding NW-02).
+            let unusual: Vec<usize> = pst
+                .inputs()
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| !input.sighash.is_default())
+                .map(|(index, _)| index)
+                .collect();
+            if !unusual.is_empty() {
+                return Err(format!(
+                    "refusing to sign: inputs {:?} use a non-default sighash type. \
+                     A signature for SIGHASH_NONE/SINGLE/ANYONECANPAY stays valid after \
+                     another party rewrites the outputs. Ask the creator to build the PST \
+                     with the default sighash type.",
+                    unusual
+                ));
+            }
             let added = pst
                 .sign_with(|lock| store.key_for(lock))
                 .map_err(|e| e.to_string())?;
