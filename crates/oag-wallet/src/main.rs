@@ -1044,7 +1044,10 @@ fn show_pst(pst: &Pst, network: Network) -> Result<(), String> {
         } else {
             format!("0x{:02x}", input.sighash.to_byte())
         };
-        println!("    [{index}] {} OAG  {where_}  sighash {sighash}  {state}", input.utxo.amount);
+        println!(
+            "    [{index}] {} OAG  {where_}  sighash {sighash}  {state}",
+            input.utxo.amount
+        );
     }
     println!("  outputs        {}", tx.outputs.len());
     for (index, output) in tx.outputs.iter().enumerate() {
