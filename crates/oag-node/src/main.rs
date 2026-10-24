@@ -590,6 +590,19 @@ fn run() -> Result<(), String> {
                     let addr = rpc.unwrap_or_else(|| {
                         SocketAddr::new(network.rpc_bind_default(), network.rpc_port())
                     });
+                    // **The RPC is plaintext HTTP with cookie authentication.** That is
+                    // fine on loopback, but an explicit non-loopback bind puts the cookie
+                    // on the wire. Say so loudly instead of failing silently (audit
+                    // finding NW-05).
+                    if !addr.ip().is_loopback() {
+                        println!(
+                            "warning: the RPC listens on {addr}, which is reachable from outside\n\
+                             this machine. It is served over plaintext HTTP and authenticated\n\
+                             by a cookie in the data directory. Anyone who can see that\n\
+                             traffic can control this node. Prefer the default loopback\n\
+                             bind, or put the RPC behind a TLS tunnel."
+                        );
+                    }
                     oag_node::start_rpc(handle.clone(), addr, &common.datadir).await?;
                 }
 

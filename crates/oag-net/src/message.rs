@@ -122,6 +122,16 @@ pub enum MessageError {
     /// ユーザエージェントが不正。
     #[error("the user agent is invalid")]
     BadUserAgent,
+    /// A payload is larger than the limit of its command.
+    #[error("the {command} payload is {actual} bytes (limit {max})")]
+    PayloadTooLarge {
+        /// The command name.
+        command: &'static str,
+        /// The actual length of the payload.
+        actual: usize,
+        /// The limit for that command.
+        max: usize,
+    },
 }
 
 /// `inv` が指すものの種別。
@@ -615,6 +625,28 @@ impl Message {
 
     /// コマンド名とペイロードからメッセージを復元する。
     pub fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, MessageError> {
+        // **Check the command-specific limit before decoding.** The frame limit
+        // (1 MiB) is common to every command, so a `block` or `tx` message would
+        // otherwise be decoded up to 1 MiB even though the consensus limit is much
+        // smaller. Decoding allocates before the chain/mempool checks run, so cap it
+        // here (SPEC §14.5).
+        match command {
+            "block" if payload.len() > oag_consensus::params::MAX_BLOCK_SIZE => {
+                return Err(MessageError::PayloadTooLarge {
+                    command: "block",
+                    actual: payload.len(),
+                    max: oag_consensus::params::MAX_BLOCK_SIZE,
+                });
+            }
+            "tx" if payload.len() > oag_consensus::params::MAX_TX_SIZE => {
+                return Err(MessageError::PayloadTooLarge {
+                    command: "tx",
+                    actual: payload.len(),
+                    max: oag_consensus::params::MAX_TX_SIZE,
+                });
+            }
+            _ => {}
+        }
         let msg = match command {
             "version" => Message::Version(VersionMessage::decode(payload)?),
             "verack" => {
