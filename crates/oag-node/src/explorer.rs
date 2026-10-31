@@ -103,6 +103,19 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
     Ok(bound)
 }
 
+/// 頁に付ける Content-Security-Policy。
+///
+/// 様式は頁の中に書いてあるので `'unsafe-inline'` を許す。JS は
+/// `script-src 'self'` で、自分の配るファイルからしか動かない。
+const CSP: &str = "Content-Security-Policy: default-src 'self'; script-src 'self'; \
+                   style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; \
+                   base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\n";
+
+/// ブラウザで SHA-256 を計算する JS。ウォレットの頁と同じものである。
+const SHA256_JS: &str = include_str!("../assets/sha256.js");
+/// 取引の頁で、ファイルがコミットメントと一致するかを確かめる JS。
+const CHECK_JS: &str = include_str!("../assets/check.js");
+
 /// 応答 1 個。
 struct Response {
     status: &'static str,
@@ -119,6 +132,8 @@ enum Kind {
     /// 読み出しも許す (`Access-Control-Allow-Origin: *`)。読むだけの
     /// 公開の数字なので、許して困るものは無い。
     Json,
+    /// 取引の頁でファイルを確かめる JS (`/sha256.js`、`/check.js`)。
+    Js,
 }
 
 async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
@@ -180,8 +195,11 @@ pub(crate) async fn read_target(stream: &mut TcpStream, buffer: &mut Vec<u8>) ->
 
 async fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
     let (kind, origin) = match response.kind {
-        Kind::Html => ("text/html; charset=utf-8", ""),
+        // **読み込み元を自分自身に限る。** JS は自分が配る 2 つだけで、
+        // 外から何も引き込まない。インラインの JS も通さない。
+        Kind::Html => ("text/html; charset=utf-8", CSP),
         Kind::Json => ("application/json", "Access-Control-Allow-Origin: *\r\n"),
+        Kind::Js => ("text/javascript; charset=utf-8", ""),
     };
     let head = format!(
         "HTTP/1.1 {}\r\n\
@@ -222,6 +240,8 @@ async fn route(shared: &Shared, target: &str) -> Response {
         ["mempool"] => mempool_page(handle).await,
         ["peers"] => peers_page(handle).await,
         ["api", "stats"] => api_stats(shared).await,
+        ["sha256.js"] => script(SHA256_JS),
+        ["check.js"] => script(CHECK_JS),
         ["api", ..] => json_error("404 Not Found", "no such endpoint"),
         _ => not_found("no such page"),
     }
@@ -1628,7 +1648,43 @@ fn tx_detail(
         );
     }
     out.push_str("</table></div>");
+    out.push_str(&file_check(tx));
     out
+}
+
+/// コミットメント出力があれば、ファイルと突き合わせる欄を付ける。
+///
+/// ファイルはブラウザの中でハッシュし (`/sha256.js`)、どこへも送らない。
+/// JS が動かないときは欄が使えないまま残り、`sha256sum` で確かめる手順が
+/// 読める。
+fn file_check(tx: &Transaction) -> String {
+    let recorded: Vec<String> = tx
+        .outputs
+        .iter()
+        .filter(|o| o.lock.is_commitment())
+        .map(|o| {
+            o.lock
+                .payload()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .collect();
+    if recorded.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<h2>check a file</h2>\
+         <p>Pick a file to see whether it is the one recorded above. Its SHA-256 \
+         is computed in this browser; <b>the file is not sent anywhere</b>.</p>\
+         <p><input type=\"file\" id=\"ts-file\" data-commitments=\"{}\" disabled></p>\
+         <p id=\"ts-out\"></p>\
+         <p class=\"warn\">Only a SHA-256 of a whole file can be checked here. \
+         Without JavaScript, compare the output of <code>sha256sum</code> \
+         with the commitment.</p>\
+         <script src=\"/sha256.js\"></script><script src=\"/check.js\"></script>",
+        esc(&recorded.join(" "))
+    )
 }
 
 fn search_box(value: &str) -> String {
@@ -1694,6 +1750,14 @@ fn error_page(message: &str) -> Response {
             "error",
             &format!("{}<h1>error</h1><p>{}</p>", search_box(""), esc(message)),
         ),
+    }
+}
+
+fn script(body: &str) -> Response {
+    Response {
+        status: "200 OK",
+        kind: Kind::Js,
+        body: body.to_string(),
     }
 }
 
@@ -1929,6 +1993,38 @@ impl TxRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commitment_gets_a_file_check_on_its_transaction_page() {
+        use oag_consensus::tx::{OutPoint, TxInput, CURRENT_TX_VERSION};
+        use oag_consensus::TxOutput;
+        let digest = vec![0xab; 32];
+        let tx = Transaction {
+            version: CURRENT_TX_VERSION,
+            inputs: vec![TxInput::new(OutPoint::new(Hash::ZERO, 0))],
+            outputs: vec![
+                TxOutput::new(Amount::ZERO, Lock::commitment(digest.clone()).unwrap()),
+                TxOutput::new(Amount::ZERO, Lock::commitment(vec![0x01, 0x02]).unwrap()),
+            ],
+            locktime: 0,
+        };
+        let html = file_check(&tx);
+        // 中身は小文字の 16 進で、`sha256sum` と同じ形。全部を突き合わせる。
+        assert!(
+            html.contains(&format!("data-commitments=\"{} 0102\"", "ab".repeat(32))),
+            "{html}"
+        );
+        assert!(html.contains("<script src=\"/sha256.js\"></script>"));
+        assert!(html.contains("<script src=\"/check.js\"></script>"));
+        // JS が動くまでは使えない。
+        assert!(html.contains("disabled"));
+
+        let plain = Transaction {
+            outputs: vec![TxOutput::new(Amount::ZERO, Lock::unspendable())],
+            ..tx
+        };
+        assert_eq!(file_check(&plain), "");
+    }
 
     #[test]
     fn everything_that_goes_into_a_page_is_escaped() {

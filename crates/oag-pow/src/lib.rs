@@ -18,12 +18,14 @@
 // **この crate だけ `forbid` ではなく `deny` である。** 他の crate は全部
 // `forbid(unsafe_code)` のままである。
 //
-// fast モードのデータセット (2 GB) を採掘スレッドの間で共有するのに、
-// `unsafe impl Send / Sync` が 2 行だけ要る。`randomx-rs` の
-// `RandomXDataset` が生ポインタを持つため、コンパイラには共有してよいか
-// 分からないからである。`forbid` は内側の `allow` で解けないので、ここを
-// `deny` に下げ、その 2 行にだけ `allow` を付けている。
-// 何を引き受けているかは `randomx::SharedDataset` に書いてある。
+// fast モードのデータセット (2 GB) を採掘スレッドの間で、light モードの
+// キャッシュ (256 MB) を検証スレッドの間で共有するのに、
+// `unsafe impl Send / Sync` が 2 行ずつ要る。`randomx-rs` の
+// `RandomXDataset` と `RandomXCache` が生ポインタを持つため、コンパイラには
+// 共有してよいか分からないからである。`forbid` は内側の `allow` で解けない
+// ので、ここを `deny` に下げ、その 4 行にだけ `allow` を付けている。
+// 何を引き受けているかは `randomx::SharedDataset` と `randomx::SharedCache`
+// に書いてある。
 #![deny(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
 

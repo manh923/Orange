@@ -293,6 +293,7 @@ const PANES = [
   ["tab-send", "pane-send"],
   ["tab-coins", "pane-coins"],
   ["tab-sign", "pane-sign"],
+  ["tab-stamp", "pane-stamp"],
 ];
 
 async function enterWallet(addresses) {
@@ -570,6 +571,59 @@ async function doSweep() {
   });
 }
 
+// ======== timestamping a file ========
+
+// The file is hashed here and the hash goes into the box; what is recorded
+// is always what the box says, so a pasted value works the same way.
+async function pickStampFile() {
+  const file = $("stamp-file").files[0];
+  say("stamp-msg", "", false);
+  if (!file) return;
+  $("do-stamp").disabled = true;
+  try {
+    const digest = await OAG_SHA256.ofFile(file, (done, total) => {
+      say("stamp-hash", `hashing… ${total ? Math.floor((done * 100) / total) : 100}%`, false);
+    });
+    $("stamp-data").value = digest;
+    say("stamp-hash", `SHA-256 of ${file.name} (${file.size} bytes)`, false);
+  } catch (e) {
+    say("stamp-hash", `cannot read the file: ${e.message}`, true);
+  } finally {
+    $("do-stamp").disabled = false;
+  }
+}
+
+async function doStamp() {
+  const data = $("stamp-data").value.trim().toLowerCase();
+  say("stamp-msg", "", false);
+  if (!/^([0-9a-f]{2}){2,40}$/.test(data)) {
+    return say("stamp-msg", "the bytes to record must be 2 to 40 bytes of hex", true);
+  }
+  // **Not before the soft fork is active** (SPEC §10.9). Until then a
+  // version 3 output is one anybody can spend, and nothing is recorded.
+  if (chain.softfork !== "active") {
+    return say("stamp-msg", `the soft fork for commitments is ${chain.softfork || "unknown"}, not active yet`, true);
+  }
+  await working($("do-stamp"), "signing…", async () => {
+    try {
+      const signed = call({
+        cmd: "commit",
+        network: chain.network,
+        data,
+        fee_rate: chain.feerate,
+        next_height: chain.height + 1,
+        coins: usableCoins(),
+      });
+      if (!confirm(`Record this on the chain?\n\n${data}\n\nThe fee is ${signed.fee} OAG. It cannot be taken back.`)) return;
+      const sent = await ask("/api/send", { hex: signed.hex });
+      say("stamp-msg", `recorded. ${sent.txid} (fee ${signed.fee} OAG) — it is final once it is in a block`, false);
+      await refresh();
+    } catch (e) {
+      say("stamp-msg", e.message, true);
+    }
+  });
+}
+
 async function doNewAddress() {
   await working($("do-newaddr"), "creating…", async () => {
     try {
@@ -699,6 +753,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("send-from").onchange = noteSendFrom;
   $("do-sweep").onclick = doSweep;
   $("do-sign").onclick = doSign;
+  $("stamp-file").onchange = pickStampFile;
+  $("do-stamp").onclick = doStamp;
   $("do-verify").onclick = doVerify;
   $("do-copysig").onclick = () => navigator.clipboard.writeText($("sign-sig").textContent);
   $("do-refresh").onclick = () => refresh();

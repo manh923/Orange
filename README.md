@@ -431,6 +431,8 @@ necessary, so it is not numbered.
 | Partially signed transactions (PST) | done |
 | UTXO consolidation (`consolidate`) | done |
 | Browser wallet (wasm) | done |
+| Commitment outputs and file timestamps | done |
+| Header PoW checked on several threads during sync | done |
 | **mainnet launched and running** | **done** |
 
 ## Crate layout
@@ -540,6 +542,14 @@ With an index, these methods become available:
 
 You can create a wallet, restore from a phrase, check a balance, send, and
 consolidate.
+
+From 0.5.2 it can also **timestamp a file**: pick it under "Timestamp" and the
+page records its SHA-256 on the chain in a commitment output. The file is
+hashed inside the browser and never sent anywhere; only the 32-byte hash goes
+into the transaction, and only the fee is paid. Anyone holding the file can
+later check it on the explorer's page for that transaction ("check a file"),
+or compare `sha256sum` with the hash. It is the same value
+`oag-wallet commit` records.
 
 ### Keys never pass through the node
 

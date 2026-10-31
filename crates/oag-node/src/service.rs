@@ -23,7 +23,7 @@
 //! **少数の nonce を試すごとに要求を捌く**。応答が遅れる上限が
 //! 少数の nonce 分の計算時間になる。
 
-use crate::node::{MinedBlock, Node, NodeError, NodeOptions, NodeStatus};
+use crate::node::{MinedBlock, Node, NodeError, NodeOptions, NodeStatus, POW_WAVE};
 use oag_chain::chain::{AcceptOutcome, HeaderOutcome};
 use oag_chain::index::BlockIndexEntry;
 use oag_consensus::lock::Lock;
@@ -1935,10 +1935,34 @@ impl Service {
         let mut new = 0;
         let mut pending = 0;
         let mut invalid = None;
-        for header in headers {
-            match self.node.accept_header(header, now) {
-                Ok(HeaderOutcome::New) => new += 1,
-                Ok(HeaderOutcome::Pending) => pending += 1,
+        // PoW は波ごとに並べて先に確かめ、受け取るのは今までどおり 1 件ずつ
+        // 順に行う (`Node::pow_verdicts`)。
+        //
+        // **次の波は、新しいヘッダが PoW まで通ってから並べる。** 並べると
+        // 安い検査より先に RandomX を回すことになる (SPEC §10.5 は PoW を
+        // 最後に見ることを求めている)。先に本物の PoW を 1 件見せたピアに
+        // だけ、その先の 64 件を前払いする。偽のヘッダで計算を無駄にさせる
+        // には、波ごとに本物の PoW が要る。
+        let mut judged: Vec<Option<bool>> = Vec::new();
+        let mut judged_from = 0;
+        for (i, header) in headers.iter().enumerate() {
+            let verdict = i
+                .checked_sub(judged_from)
+                .and_then(|k| judged.get(k).copied())
+                .flatten();
+            match self.node.accept_header_with_verdict(header, verdict, now) {
+                Ok(outcome @ (HeaderOutcome::New | HeaderOutcome::Pending)) => {
+                    if outcome == HeaderOutcome::New {
+                        new += 1;
+                    } else {
+                        pending += 1;
+                    }
+                    if i + 1 >= judged_from + judged.len() {
+                        let end = headers.len().min(i + 1 + POW_WAVE);
+                        judged = self.node.pow_verdicts(&headers[i + 1..end]);
+                        judged_from = i + 1;
+                    }
+                }
                 Ok(HeaderOutcome::Known) => {}
                 // 1 個でも駄目なら、そこで止める。以降は繋がらない。
                 Err(e) if header_is_invalid(&e) => {

@@ -12,7 +12,7 @@
 //!
 //! | 口 | できること |
 //! |---|---|
-//! | `/api/info` | 高さとネットワークを見る |
+//! | `/api/info` | 高さとネットワークとソフトフォークの様子を見る |
 //! | `/api/scan` | 渡されたアドレスの未使用出力を数える |
 //! | `/api/history` | 渡されたアドレスの履歴を読む |
 //! | `/api/send` | 署名済みのものを mempool へ渡す |
@@ -290,6 +290,11 @@ async fn route(handle: &NodeHandle, head: &Head, body: &[u8]) -> Response {
             content_type: "text/javascript; charset=utf-8",
             body: APP_JS.as_bytes().to_vec(),
         },
+        ("GET", "/sha256.js") => Response {
+            status: "200 OK",
+            content_type: "text/javascript; charset=utf-8",
+            body: SHA256_JS.as_bytes().to_vec(),
+        },
         ("GET", "/wallet.wasm") => Response {
             status: "200 OK",
             content_type: "application/wasm",
@@ -347,8 +352,8 @@ fn locks_of(
 }
 
 async fn api_info(handle: &NodeHandle) -> Response {
-    let height = match handle.status().await {
-        Ok(status) => status.height,
+    let (height, softfork) = match handle.status().await {
+        Ok(status) => (status.height, status.softfork.state.name()),
         Err(e) => return Response::fault("500 Internal Server Error", &e),
     };
     let indexed = handle.index_from().await.ok().flatten().is_some();
@@ -361,6 +366,9 @@ async fn api_info(handle: &NodeHandle) -> Response {
             "maturity": oag_consensus::params::COINBASE_MATURITY,
             "feerate": oag_consensus::params::MIN_RELAY_FEE_RATE_PER_BYTE.to_atomic().to_string(),
             "dust": oag_consensus::params::DUST_THRESHOLD.to_atomic().to_string(),
+            // コミットメント出力のソフトフォーク (SPEC §10.9)。`active` に
+            // なるまで画面は刻まない。
+            "softfork": softfork,
         })
         .to_string(),
     )
@@ -503,6 +511,8 @@ async fn api_send(handle: &NodeHandle, body: &[u8]) -> Response {
 /// 作り直し方は `crates/oag-node/assets/README.md` にある。
 static WALLET_WASM: &[u8] = include_bytes!("../assets/wallet.wasm");
 const APP_JS: &str = include_str!("../assets/wallet.js");
+/// ファイルの SHA-256 をブラウザで計算する JS。エクスプローラと同じもの。
+const SHA256_JS: &str = include_str!("../assets/sha256.js");
 const APP_HTML: &str = include_str!("../assets/wallet.html");
 
 /// 画面を組む。様式はエクスプローラと同じものを使う。

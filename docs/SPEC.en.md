@@ -1515,6 +1515,14 @@ Every per-network default is currently empty (`None`): putting a value there
 means claiming that a block at that height is genuine, and not enough time has
 passed to make that claim.
 
+**For OAG, a default would hardly shorten the sync anyway.** Only signatures are
+skipped, and what takes the time in an OAG initial sync is the proof of work. In
+2026-10 the chain is about 60,000 blocks and a light-mode hash takes around
+30 ms, so one thread spends about 30 minutes. Signatures, with few transactions,
+take under a second in total. So no default is set, and from 0.5.2 **header PoW
+is checked on several threads in parallel** instead ([§14.5](#the-sync-procedure)).
+The PoW itself is not skipped.
+
 The mempool is **always checked in full**. This is a relaxation that is only
 defensible for the deeply buried past; it does not apply to unconfirmed
 transactions.
@@ -1617,9 +1625,10 @@ blocks it finds are the same.
 
 **Thread safety**: a RandomX VM holds an internal scratchpad and must not be
 shared across threads. When validating or mining in parallel, there **MUST be one
-VM per thread.** Note that even light mode needs a 256 MB cache per thread (the
-cache itself can be shared, but this implementation prefers simplicity and does
-not share it).
+VM per thread.** The light-mode cache (256 MB) is only read after it is
+initialised, so it may be shared by several VMs. From 0.5.2 this implementation
+shares it when checking header PoW in parallel during the initial sync
+([§14.5](#the-sync-procedure)). Light-mode mining still does not share it.
 
 #### Mining with several threads
 
@@ -1634,8 +1643,8 @@ templates with a generation number and discards mismatches (the `pool` module in
 `oag-miner`).
 
 The fast-mode dataset **SHOULD be shared by all threads, one copy**. Each extra
-thread only adds its VM's 2 MB scratchpad. Light mode multiplies by the thread
-count in this implementation, because the cache is not shared.
+thread only adds its VM's 2 MB scratchpad. Light-mode mining multiplies by the
+thread count in this implementation, because there the cache is not shared.
 
 | Mode | 1 thread | With 4 threads |
 | --- | ---: | ---: |
@@ -1648,12 +1657,14 @@ threads).
 
 > **How this implementation is built**: in `randomx-rs` 1.6.0, `RandomXDataset`
 > is not `Send`, because it holds a raw pointer. `SharedDataset` in `oag-pow`
-> wraps it and carries two lines of `unsafe impl Send / Sync`. **Those two lines
-> are the only `unsafe` written anywhere in the workspace.** `oag-pow` alone is
+> wraps it and carries two lines of `unsafe impl Send / Sync`. From 0.5.2,
+> `SharedCache`, which wraps the light-mode cache, carries the same two lines.
+> **Those four lines are the only `unsafe` written anywhere in the workspace.**
+> `oag-pow` alone is
 > lowered to `#![deny(unsafe_code)]`; every other crate keeps
 > `#![forbid(unsafe_code)]`. What those lines take responsibility for (read-only
 > after initialisation, RandomX's own benchmark uses it the same way, freed
-> exactly once through `Arc`) is written on `SharedDataset`.
+> exactly once through `Arc`) is written on `SharedDataset` and `SharedCache`.
 >
 > The VM is not wrapped. **The miner is still not passed around — the recipe
 > is.** The recipe carries the `SharedDataset` across the thread boundary, and
@@ -2280,6 +2291,39 @@ feed you irrelevant blocks indefinitely.
 Whoever mines a new block announces it with `inv`. The receiver **cannot tell the
 height or the linkage from a hash alone**, so rather than asking for the body
 directly it starts again from `getheaders`.
+
+#### Header PoW may be checked in parallel
+
+The PoW (RandomX) of each header can be computed independently. An
+implementation MAY check it on several threads. **The result MUST be the same as
+checking one header at a time**: the order of acceptance and the place where an
+invalid header stops the batch do not change.
+
+Checking in parallel means computing PoW before height, time and difficulty,
+which could go against "PoW last" in [§10.5](#105-validation-order-dos-resistance).
+So **only the part of a `headers` message after a new header has passed its PoW
+may be checked in parallel** (MUST). Making a node waste work with fake headers
+then costs real PoW for every batch.
+
+This implementation (from 0.5.2) accepts a `headers` message one header at a
+time from the start, and once a new header has passed its PoW, checks the next
+64 as one batch in parallel. When the batch is used up, it does the same again.
+
+1. Check that the parent of the batch's first header is known. If not, do not
+   check in parallel.
+2. From the start, take only the part that links up (each parent is the previous
+   hash, and heights go up by one).
+3. A seed lies at least 64 heights back ([§11.3](#113-seed-epochs)), so within 64
+   headers every header's seed can be found as an ancestor of the first header's
+   parent. One cache is built per seed, and the threads (as many as CPUs, at most
+   8) compute on their own VMs.
+4. Headers are still accepted one at a time in order. Height, parent, time and
+   difficulty are checked there, and the verdict found earlier is used for the
+   PoW item only. A header with no verdict runs RandomX on the spot.
+
+A peer sending invalid headers can make a node waste at most 64 hashes for each
+real PoW it shows. It is still banned at the first invalid header
+([§10.5](#105-validation-order-dos-resistance)).
 
 #### When told they do not have it, reassign immediately
 

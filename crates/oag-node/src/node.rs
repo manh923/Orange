@@ -22,11 +22,12 @@ use oag_consensus::validate::PowVerifier;
 use oag_consensus::{Block, BlockHeader, Transaction};
 use oag_mempool::{Mempool, Reject};
 use oag_miner::{build_template, BlockTemplate, TemplateError, TemplateRequest};
-use oag_pow::randomx::{RandomXPowError, RandomXVerifier};
+use oag_pow::randomx::{RandomXPowError, RandomXVerifier, SharedCache};
 use oag_pow::seed_height;
 use oag_primitives::{Amount, Hash, Network};
 use oag_store::{Store, StoreError};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// ノードの失敗。
 #[derive(Debug, thiserror::Error)]
@@ -156,7 +157,13 @@ pub struct Node {
     /// 掘れたブロックは light の検証器に通す。両者が同じハッシュを返す
     /// ことは `oag-pow` の試験で確かめてあるが、確かめてあることと
     /// 実際に通すことは別である。
-    verifier: Option<(u64, RandomXVerifier)>,
+    ///
+    /// キャッシュ ([`SharedCache`]) も一緒に持つ。ヘッダの PoW を並べて
+    /// 確かめるときに、各スレッドがその上に自分の VM を建てる
+    /// ([`Node::pow_verdicts`])。
+    verifier: Option<(u64, SharedCache, RandomXVerifier)>,
+    /// ヘッダの PoW を並べて確かめるスレッドの数。1 なら並べない。
+    pow_threads: usize,
     /// ピアの住所帳。
     addresses: AddressBook,
 }
@@ -287,6 +294,7 @@ impl Node {
             mempool: Mempool::new(),
             network,
             verifier: None,
+            pow_threads: default_pow_threads(),
             addresses,
         })
     }
@@ -381,12 +389,12 @@ impl Node {
         if self
             .verifier
             .as_ref()
-            .is_some_and(|(current, _)| *current == wanted)
+            .is_some_and(|(current, _, _)| *current == wanted)
         {
             return Ok(());
         }
         let seed = self.seed_for(wanted, branch)?;
-        let verifier = RandomXVerifier::new(&seed, wanted)?;
+        let (shared, verifier) = SharedCache::with_verifier(&seed, wanted)?;
         if !verifier.uses_jit() {
             // JIT を使えない環境である。検証は動くが 10 倍ほど遅い。
             // 黙っていると「なぜか同期が進まない」に見えるので伝える。
@@ -399,7 +407,7 @@ impl Node {
             "switched the RandomX seed to block {} at height {wanted}",
             crate::log::short(&seed)
         );
-        self.verifier = Some((wanted, verifier));
+        self.verifier = Some((wanted, shared, verifier));
         Ok(())
     }
 
@@ -414,9 +422,9 @@ impl Node {
         f: impl FnOnce(&mut Self, &RandomXVerifier) -> Result<T, NodeError>,
     ) -> Result<T, NodeError> {
         self.ensure_verifier(height, branch)?;
-        let (epoch, verifier) = self.verifier.take().expect("prepared just beforehand");
+        let (epoch, shared, verifier) = self.verifier.take().expect("prepared just beforehand");
         let result = f(self, &verifier);
-        self.verifier = Some((epoch, verifier));
+        self.verifier = Some((epoch, shared, verifier));
         result
     }
 
@@ -497,16 +505,141 @@ impl Node {
         header: &BlockHeader,
         now: i64,
     ) -> Result<HeaderOutcome, NodeError> {
+        self.accept_header_with_verdict(header, None, now)
+    }
+
+    /// 他所から来たヘッダを、PoW の判定を添えて受け取る。
+    ///
+    /// `verdict` は [`Node::pow_verdicts`] が出したもの。`None` なら
+    /// [`Node::accept_header`] と同じく、ここで RandomX を回す。
+    ///
+    /// **判定が使われるのは PoW の 1 項目だけである。** 高さ・親・時刻・
+    /// 難易度は、判定があってもなくてもここで確かめる。
+    pub fn accept_header_with_verdict(
+        &mut self,
+        header: &BlockHeader,
+        verdict: Option<bool>,
+        now: i64,
+    ) -> Result<HeaderOutcome, NodeError> {
         if self.chain.contains(&header.hash())? {
             return Ok(self
                 .chain
                 .accept_header(header, &HeaderAlreadyChecked, now)?);
+        }
+        if let Some(meets) = verdict {
+            let judged = Judged {
+                hash: header.hash(),
+                meets,
+            };
+            return Ok(self.chain.accept_header(header, &judged, now)?);
         }
         let height = header.height;
         let branch = header.prev_hash;
         self.with_verifier(height, &branch, |node, verifier| {
             Ok(node.chain.accept_header(header, verifier, now)?)
         })
+    }
+
+    /// ヘッダの PoW を、複数のスレッドで並べて確かめる。
+    ///
+    /// 戻り値は `headers` と同じ並びで、判定できたものは `Some`、できな
+    /// かったものは `None` である。`None` のヘッダは
+    /// [`Node::accept_header_with_verdict`] が今までどおり 1 件ずつ確かめる。
+    /// **ここで判定を諦めても、検証が抜けることはない。**
+    ///
+    /// 初期同期の時間は、ほとんどがヘッダの PoW である (light で 1 件
+    /// 30 ms 前後、署名の検証は全部で 1 秒もかからない)。assumevalid が
+    /// 省くのは署名だけなので、ここを並べないと速くならない。
+    ///
+    /// # 何を確かめるか
+    ///
+    /// 先頭から [`POW_WAVE`] 件までの、**互いに繋がっている部分**だけを見る
+    /// (次の親が前のハッシュで、高さが 1 つずつ増える)。その中で、まだ
+    /// 知らないもの、かつシードのブロックが先頭の親以下にあるものを選ぶ。
+    /// シードは高さの 64 以上前にあるので、64 件以内ならいつも先頭の親から
+    /// 祖先を辿って引ける。
+    ///
+    /// 判定はここで出した時点のシードによる。受け取るときにチェーンが
+    /// 高さと親を確かめるので、判定を使えるのは、先頭の親から 1 つずつ
+    /// 繋がっていると確かめられたヘッダだけである。すなわち、ここで仮定
+    /// した枝と同じ枝にある。
+    ///
+    /// # 悪いピア
+    ///
+    /// ここでは高さ・時刻・難易度より先に RandomX を回す。SPEC §10.5 は
+    /// PoW を最後に見ることを求めているので、**呼ぶ側は、直前のヘッダが
+    /// PoW まで通ってから呼ぶこと** (`Service::accept_headers`)。そうすれば
+    /// 偽のヘッダで無駄にさせられる計算は、本物の PoW 1 件につき最大
+    /// [`POW_WAVE`] 件に限られ、最初の無効なヘッダで出入り禁止になる。
+    pub fn pow_verdicts(&mut self, headers: &[BlockHeader]) -> Vec<Option<bool>> {
+        let mut verdicts = vec![None; headers.len()];
+        let threads = self.pow_threads;
+        let Some(first) = headers.first() else {
+            return verdicts;
+        };
+        if threads < 2 || headers.len() < 2 {
+            return verdicts;
+        }
+        let branch = first.prev_hash;
+        let base = first.height;
+        // 親を知らないヘッダは、チェーンが PoW を見る前に断る。ここで回すと、
+        // 繋がらないヘッダを送るだけで RandomX を回させられる。
+        if !self.chain.contains(&branch).unwrap_or(false) {
+            return verdicts;
+        }
+
+        let mut hashes = vec![first.hash()];
+        for pair in headers.windows(2).take(POW_WAVE - 1) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            let prev_hash = *hashes.last().expect("starts with one");
+            if next.prev_hash != prev_hash || prev.height.checked_add(1) != Some(next.height) {
+                break;
+            }
+            hashes.push(next.hash());
+        }
+
+        // シードの高さごとに分ける。高さが増える順なので、境目は高々 1 つ。
+        let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, hash) in hashes.iter().enumerate() {
+            match self.chain.contains(hash) {
+                Ok(false) => {}
+                // 知っているものは見直さない。読めなかったものは 1 件ずつの
+                // 経路に任せる (そこで誤りになる)。
+                Ok(true) | Err(_) => continue,
+            }
+            let wanted = seed_height(headers[i].height);
+            if wanted >= base {
+                continue;
+            }
+            match groups.last_mut() {
+                Some((seed, members)) if *seed == wanted => members.push(i),
+                _ => groups.push((wanted, vec![i])),
+            }
+        }
+
+        for (_, members) in groups {
+            // 1 件ずつ受け取るときと同じ検証器を用意する。エポックが同じなら
+            // 作り直さない。用意できなければ判定しない (1 件ずつの経路で
+            // 同じ誤りが出る)。
+            if self
+                .ensure_verifier(headers[members[0]].height, &branch)
+                .is_err()
+            {
+                continue;
+            }
+            let Some((_, shared, _)) = self.verifier.as_ref() else {
+                continue;
+            };
+            for (i, verdict) in verify_in_parallel(shared, headers, &members, threads) {
+                verdicts[i] = verdict;
+            }
+        }
+        verdicts
+    }
+
+    /// ヘッダの PoW を並べて確かめるスレッドの数を変える。1 で並べない。
+    pub fn set_pow_threads(&mut self, threads: usize) {
+        self.pow_threads = threads.clamp(1, MAX_POW_THREADS);
     }
 
     /// 次のブロックを掘る土台を組む。
@@ -642,6 +775,84 @@ struct HeaderAlreadyChecked;
 impl PowVerifier for HeaderAlreadyChecked {
     fn verify(&self, _header: &BlockHeader) -> bool {
         false
+    }
+}
+
+/// [`Node::pow_verdicts`] が 1 回に確かめるヘッダの数の上限。
+///
+/// シードは高さの [`SEED_LAG`](oag_consensus::params::SEED_LAG) (64) 以上前に
+/// あるので、これを超えなければ、どのヘッダのシードも先頭の親から引ける。
+pub const POW_WAVE: usize = 64;
+
+/// ヘッダの PoW を並べて確かめるスレッドの数の上限。
+///
+/// 1 本につき VM の 2 MB と JIT の符号だけが増える (キャッシュは共有)。
+/// 64 件を 8 本で分けると 1 本 8 件であり、それより増やしても VM を建てる
+/// 手間が目立ってくる。
+const MAX_POW_THREADS: usize = 8;
+
+/// 既定のスレッドの数。CPU の数 (上限 [`MAX_POW_THREADS`])。
+fn default_pow_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, MAX_POW_THREADS)
+}
+
+/// `members` のヘッダの PoW を、`threads` 本のスレッドで確かめる。
+///
+/// 各スレッドはキャッシュの上に自分の VM を建て、番号を 1 つずつ取って
+/// いく。VM を建てられなかったスレッドは何も取らずに抜けるので、その分は
+/// ほかのスレッドが確かめる。全部が抜けたら判定は `None` のまま残る。
+fn verify_in_parallel(
+    shared: &SharedCache,
+    headers: &[BlockHeader],
+    members: &[usize],
+    threads: usize,
+) -> Vec<(usize, Option<bool>)> {
+    let next = AtomicUsize::new(0);
+    let workers = threads.min(members.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("oag-pow-verify".to_string())
+                    .spawn_scoped(scope, || {
+                        let mut out = Vec::new();
+                        let Ok(verifier) = shared.verifier() else {
+                            return out;
+                        };
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&i) = members.get(k) else {
+                                break;
+                            };
+                            // 誤り (エポックの食い違いなど) は判定しない。
+                            out.push((i, verifier.check(&headers[i]).ok()));
+                        }
+                        out
+                    })
+                    .ok()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// [`Node::pow_verdicts`] が先に出した判定を、チェーンに渡すための検証器。
+///
+/// 判定を出したヘッダ以外が来たら通さない。来ないはずだが、来ても素通り
+/// させない。
+struct Judged {
+    hash: Hash,
+    meets: bool,
+}
+
+impl PowVerifier for Judged {
+    fn verify(&self, header: &BlockHeader) -> bool {
+        self.meets && header.hash() == self.hash
     }
 }
 
@@ -814,5 +1025,170 @@ mod tests {
         let orphaned = orphaned_transactions(&reorg, |_| Ok(None)).unwrap();
 
         assert!(orphaned.is_empty());
+    }
+
+    /// 1 分おきの時刻で `count` 個掘り、ヘッダを返す。難易度は 1 のまま。
+    fn mine(node: &mut Node, count: u64) -> (Vec<BlockHeader>, i64) {
+        let mut now = crate::genesis::genesis_for(Network::Regtest)
+            .header
+            .timestamp;
+        let mut headers = Vec::new();
+        for i in 0..count {
+            now += 60;
+            let template = node.mining_template(&Lock::unspendable(), now, i).unwrap();
+            assert_eq!(template.header.difficulty, 1, "regtest left difficulty 1");
+            let block = template.into_block();
+            headers.push(block.header);
+            node.accept_mined(block, now).unwrap();
+        }
+        (headers, now)
+    }
+
+    #[test]
+    fn headers_judged_in_parallel_are_accepted_like_one_by_one() {
+        let (dir_a, mut a) = open_regtest("pow-wave-a");
+        let (headers, now) = mine(&mut a, 100);
+        let (dir_b, mut b) = open_regtest("pow-wave-b");
+        b.set_pow_threads(4);
+
+        for wave in headers.chunks(POW_WAVE) {
+            let verdicts = b.pow_verdicts(wave);
+            assert_eq!(
+                verdicts,
+                vec![Some(true); wave.len()],
+                "not judged in parallel"
+            );
+            for (header, verdict) in wave.iter().zip(verdicts) {
+                let outcome = b.accept_header_with_verdict(header, verdict, now).unwrap();
+                assert_eq!(outcome, HeaderOutcome::New);
+            }
+        }
+        assert_eq!(
+            b.chain.best_header().unwrap().hash,
+            a.chain.best_header().unwrap().hash
+        );
+        // 知っているものは判定し直さない。
+        assert_eq!(b.pow_verdicts(&headers[..10]), vec![None; 10]);
+
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn a_parallel_verdict_is_what_the_chain_uses() {
+        let (dir_a, mut a) = open_regtest("pow-verdict-a");
+        let (headers, now) = mine(&mut a, 3);
+        let (dir_b, mut b) = open_regtest("pow-verdict-b");
+        b.set_pow_threads(4);
+
+        // 難易度を書き換えたヘッダは PoW を満たさない。判定は 1 件ずつの
+        // 検証器と同じになる。
+        let mut forged = headers[1];
+        forged.difficulty = u64::MAX;
+        assert_eq!(
+            b.pow_verdicts(&[headers[0], forged]),
+            vec![Some(true), Some(false)]
+        );
+
+        // 「満たさない」の判定を渡せば、正しいヘッダでも撥ねる。
+        // すなわち判定は実際に使われている。
+        assert!(b
+            .accept_header_with_verdict(&headers[0], Some(false), now)
+            .is_err());
+        assert_eq!(
+            b.accept_header_with_verdict(&headers[0], Some(true), now)
+                .unwrap(),
+            HeaderOutcome::New
+        );
+
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn headers_that_cannot_be_judged_are_left_to_the_one_by_one_path() {
+        let (dir_a, mut a) = open_regtest("pow-skip-a");
+        let (headers, _) = mine(&mut a, 4);
+        let (dir_b, mut b) = open_regtest("pow-skip-b");
+
+        // 1 本なら並べない。検証器も用意しない。
+        b.set_pow_threads(1);
+        assert_eq!(b.pow_verdicts(&headers), vec![None; 4]);
+        assert!(
+            b.verifier.is_none(),
+            "built a verifier without judging anything"
+        );
+
+        b.set_pow_threads(4);
+        // 親を知らない波は判定しない。
+        assert_eq!(b.pow_verdicts(&headers[1..]), vec![None; 3]);
+        assert!(
+            b.verifier.is_none(),
+            "built a verifier for an unknown parent"
+        );
+        // 繋がっていないところから先は判定しない。
+        let gap = [headers[0], headers[2], headers[3]];
+        assert_eq!(b.pow_verdicts(&gap), vec![Some(true), None, None]);
+
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn a_wave_across_the_seed_boundary_uses_the_right_seed_on_each_side() {
+        // 高さ 2112 からシードが高さ 2048 のブロックに変わる。その境目を
+        // またぐ波で、両側がそれぞれ正しいシードで判定されること。
+        //
+        // regtest の難易度 1 ではどのハッシュも通るので、シードを取り違えても
+        // 見えない。そこで波のヘッダを難易度 2 に書き換えて繋ぎ直し、1 件
+        // ずつの検証器の判定と突き合わせる。64 件がたまたま揃う見込みは無い。
+        let (dir_a, mut a) = open_regtest("pow-epoch-a");
+        let base = 2_090u64;
+        let (headers, now) = mine(&mut a, base - 1 + POW_WAVE as u64);
+        let (dir_b, mut b) = open_regtest("pow-epoch-b");
+        b.set_pow_threads(4);
+        for wave in headers[..base as usize - 1].chunks(POW_WAVE) {
+            let verdicts = b.pow_verdicts(wave);
+            for (header, verdict) in wave.iter().zip(verdicts) {
+                b.accept_header_with_verdict(header, verdict, now).unwrap();
+            }
+        }
+
+        let mut forged: Vec<BlockHeader> = headers[base as usize - 1..][..POW_WAVE].to_vec();
+        let mut prev = headers[base as usize - 2].hash();
+        for header in &mut forged {
+            header.prev_hash = prev;
+            header.difficulty = 2;
+            prev = header.hash();
+        }
+        assert_eq!(forged[0].height, base);
+        assert!(forged.iter().any(|h| seed_height(h.height) == 0));
+        assert!(forged.iter().any(|h| seed_height(h.height) == 2_048));
+
+        let first = RandomXVerifier::new(&a.seed_for(0, &headers[0].hash()).unwrap(), 0).unwrap();
+        let second =
+            RandomXVerifier::new(&a.seed_for(2_048, &headers[2_100].hash()).unwrap(), 2_048)
+                .unwrap();
+        let expected: Vec<Option<bool>> = forged
+            .iter()
+            .map(|h| {
+                let v = if seed_height(h.height) == 0 {
+                    &first
+                } else {
+                    &second
+                };
+                Some(v.check(h).unwrap())
+            })
+            .collect();
+        assert!(expected.contains(&Some(true)) && expected.contains(&Some(false)));
+
+        assert_eq!(b.pow_verdicts(&forged), expected);
+
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
     }
 }

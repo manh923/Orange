@@ -163,3 +163,48 @@ async fn being_a_little_behind_is_not_syncing() {
     b.accept_headers(headers).await.unwrap();
     assert!(!b.is_syncing().await.unwrap());
 }
+
+/// 多くのヘッダを一度に渡すと、PoW は並べて確かめられる。受け取った数と、
+/// 無効なヘッダで止まる位置は、1 件ずつ確かめたときと同じであること。
+#[tokio::test(flavor = "multi_thread")]
+async fn many_headers_are_checked_in_waves_and_stop_at_the_first_bad_one() {
+    let blocks = 150;
+    let (_a_dir, a) = start("waves-a");
+    let a = a.handle();
+    let payout = Lock::from_address(&Address::from_pubkey(
+        NETWORK,
+        &SecretKey::generate().public_key(),
+    ));
+    a.start_mining(payout, Some(blocks), MiningMode::light())
+        .await
+        .expect("mining starts");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while a.status().await.unwrap().height < blocks {
+        assert!(Instant::now() < deadline, "A did not mine {blocks} blocks");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (_b_dir, b) = start("waves-b");
+    let b = b.handle();
+    let headers = a
+        .headers_after(b.locator().await.unwrap(), Hash::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(headers.len() as u64, blocks);
+
+    // 100 件目を書き換える。並べて確かめる波の中にある。
+    let mut forged = headers.clone();
+    forged[99].difficulty = forged[99].difficulty.wrapping_mul(3).max(2);
+    let accepted = b.accept_headers(forged).await.unwrap();
+    assert_eq!(accepted.new, 99, "did not stop right at the bad header");
+    assert!(
+        accepted.invalid.is_some(),
+        "the bad header was not reported"
+    );
+
+    // 正しいものを渡せば、残りが全部入る。
+    let (_c_dir, c) = start("waves-c");
+    let c = c.handle();
+    let accepted = c.accept_headers(headers.clone()).await.unwrap();
+    assert_eq!(accepted.new as u64, blocks);
+    assert!(accepted.invalid.is_none(), "{:?}", accepted.invalid);
+}

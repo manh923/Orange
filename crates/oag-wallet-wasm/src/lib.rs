@@ -39,7 +39,9 @@ use oag_consensus::codec::Encode;
 use oag_consensus::lock::Lock;
 use oag_consensus::tx::{OutPoint, TxOutput};
 use oag_primitives::{Address, Amount, Hash, Network};
-use oag_wallet::build::{build, consolidate, sign, Coin, Consolidate, Draft, Spend};
+use oag_wallet::build::{
+    build, commit, consolidate, sign, Coin, Commit, Consolidate, Draft, Spend,
+};
 use oag_wallet::keystore::{Keystore, NONCE_LEN, SALT_LEN};
 use oag_wallet::message;
 use oag_wallet::Mnemonic;
@@ -139,6 +141,7 @@ fn dispatch(text: &str) -> Result<Value, String> {
         "phrase" => cmd_phrase(),
         "pay" => cmd_pay(&request),
         "sweep" => cmd_sweep(&request),
+        "commit" => cmd_commit(&request),
         "sign_message" => cmd_sign_message(&request),
         "verify_message" => cmd_verify_message(&request),
         other => Err(format!("unknown command: {other}")),
@@ -324,7 +327,39 @@ fn cmd_sweep(request: &Value) -> Result<Value, String> {
     })
 }
 
-/// 署名して、画面に出すための数字を添える。
+/// コミットメント出力を刻む (SPEC §7.7)。
+///
+/// 中身 (`data`、16 進で 2〜40 バイト) を金額 0 の出力に入れ、手数料だけを
+/// 払う。おつりは既定のアドレスへ戻す。CLI の `oag-wallet commit` と同じ
+/// 組み方である。
+///
+/// **ソフトフォークが有効かどうかはここでは見ない。** 見るのは呼んだ側
+/// (画面) で、ノードの `/api/info` の `softfork` が `active` のときだけ
+/// 送ること。有効化の前の版数 3 は誰でも使える出力であり、刻んだことに
+/// ならない。
+fn cmd_commit(request: &Value) -> Result<Value, String> {
+    let payload = hex_field(request, "data")?;
+    let fee_rate = fee_rate_field(request)?;
+    let next_height = u64_field(request, "next_height")?;
+
+    with_open(|store| {
+        let coins = coins_field(request)?;
+        let change_to = Lock::from_address(
+            &store
+                .default_address()
+                .map_err(|e| format!("cannot look up the change address: {e}"))?,
+        );
+        let order = Commit {
+            payload,
+            change_to,
+            next_height,
+            fee_rate,
+        };
+        let draft = commit(&coins, &order).map_err(|e| e.to_string())?;
+        finish(store, &draft)
+    })
+}
+
 /// メッセージに署名する。
 ///
 /// **これは送金ではない。** 返るのは署名だけで、チェーンには何も起きない。
@@ -376,6 +411,7 @@ fn cmd_verify_message(request: &Value) -> Result<Value, String> {
     }))
 }
 
+/// 署名して、画面に出すための数字を添える。
 fn finish(store: &Keystore, draft: &Draft) -> Result<Value, String> {
     let signed = sign(draft, |lock| store.key_for(lock)).map_err(|e| e.to_string())?;
     let raw = signed.encode();
@@ -672,6 +708,50 @@ mod tests {
             .encode();
         let message = err(&serde_json::to_string(&pay(&stranger)).unwrap());
         assert!(message.contains("not one of this wallet's"), "{message}");
+    }
+
+    /// 刻むのは中身だけで、金額は 0。残りはおつりとして戻る。
+    #[test]
+    fn a_commitment_carries_the_data_and_nothing_else() {
+        let made = make_wallet();
+        let mine = made["addresses"][0].as_str().unwrap().to_string();
+        let commit = |data: &str| {
+            json!({
+                "cmd": "commit", "network": "regtest", "data": data,
+                "fee_rate": "50000000000", "next_height": 200,
+                "coins": [{
+                    "txid": "55".repeat(32), "index": 0, "amount": "100000000000000000",
+                    "height": 10, "coinbase": true, "address": mine,
+                }],
+            })
+        };
+        // `sha256sum` が出すのと同じ 32 バイト。
+        let digest = "ab".repeat(32);
+        let made = ok(&serde_json::to_string(&commit(&digest)).unwrap());
+        let raw = hex::decode(made["hex"].as_str().unwrap()).unwrap();
+        let tx = oag_consensus::Transaction::decode(&raw).unwrap();
+        let note = &tx.outputs[0];
+        assert!(note.lock.is_commitment());
+        assert_eq!(hex::encode(note.lock.payload()), digest);
+        assert_eq!(note.amount, Amount::ZERO);
+        let back = Lock::from_address(&Address::decode(&mine).unwrap());
+        assert!(
+            tx.outputs.iter().any(|o| o.lock == back),
+            "no change came back"
+        );
+        assert!(tx.inputs[0].signature.iter().any(|b| *b != 0));
+
+        // 長さの決まり (2〜40 バイト) はブラウザでも効く。
+        let message = err(&serde_json::to_string(&commit("ab")).unwrap());
+        assert!(message.contains("commitment"), "{message}");
+        let message = err(&serde_json::to_string(&commit(&"ab".repeat(41))).unwrap());
+        assert!(message.contains("commitment"), "{message}");
+        // 閉じていれば刻めない。
+        ok(r#"{"cmd":"lock"}"#);
+        assert_eq!(
+            err(&serde_json::to_string(&commit(&digest)).unwrap()),
+            "no wallet is open"
+        );
     }
 
     /// コインベースは成熟するまで使えない。**ブラウザでも同じ規則が効く。**

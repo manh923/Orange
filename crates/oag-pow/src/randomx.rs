@@ -25,7 +25,7 @@
 //!
 //! この crate は `#![deny(unsafe_code)]`、他の crate は全部
 //! `#![forbid(unsafe_code)]` である。自分で書いた `unsafe` は
-//! [`SharedDataset`] の `unsafe impl` 2 行だけである。ただしそれらが縛るのは
+//! [`SharedDataset`] と [`SharedCache`] の `unsafe impl` 2 行ずつだけである。ただしそれらが縛るのは
 //! **自分が書いたコードだけ**である。`randomx-rs` の中の `unsafe` も、その
 //! 先の C++ も縛らない。したがってメモリ安全は、この境界で相手に何を渡し、
 //! 相手から何を受け取るかで決まる。以下は `randomx-rs` 1.6.0 を読んだうえで
@@ -81,15 +81,23 @@
 //! 現実的でなくなる。Monero も XMRig も 1 本を全スレッドで共有している。
 //!
 //! そこで [`SharedDataset`] に `unsafe impl Send / Sync` を 2 行だけ書いた。
-//! この crate で `unsafe` と書いてあるのはそこだけである。引き受けている
-//! 事柄は [`SharedDataset`] に書いてある。要点は、**データセットは初期化が
-//! 済めば読むだけのものであり、RandomX 自身が複数の VM での共有を想定して
-//! いる**ことである。
+//! 引き受けている事柄は [`SharedDataset`] に書いてある。要点は、**データ
+//! セットは初期化が済めば読むだけのものであり、RandomX 自身が複数の VM での
+//! 共有を想定している**ことである。
 //!
 //! VM は相変わらず共有しない。スクラッチパッドを書き換えるからである。
 //! 各作業スレッドは [`SharedDataset::miner`] で自分の VM を建てる。
 //! スレッド境界を越えるのは [`SharedDataset`] だけで、[`RandomXMiner`] も
 //! [`RandomXVerifier`] もそれぞれのスレッドの上で建ち、そこから動かない。
+//!
+//! ## light のキャッシュも共有する
+//!
+//! 初期同期では、ヘッダの PoW を確かめる時間がほとんどを占める (1 件
+//! 30 ms 前後、6 万件で 30 分)。0.5.2 から複数のスレッドで並べて確かめる。
+//! そのために light のキャッシュ (256 MB) を [`SharedCache`] で包み、同じ
+//! 形の `unsafe impl Send / Sync` を 2 行足した。**この crate で `unsafe` と
+//! 書いてあるのは、この 2 つの型の 4 行だけである。** 各スレッドは
+//! [`SharedCache::verifier`] で自分の VM を建てる。
 //!
 //! ## 大きなページ
 //!
@@ -299,22 +307,9 @@ impl RandomXVerifier {
     /// どれになったかは
     /// [`RandomXVerifier::flags`] と [`RandomXVerifier::uses_jit`] で分かる。
     pub fn new(seed: &Hash, seed_height: u64) -> Result<RandomXVerifier, RandomXPowError> {
-        // FLAG_FULL_MEM を足さないので light モードになる。
-        let steps = flag_ladder(false);
-        // 候補ごとにキャッシュから作り直す。キャッシュと VM のフラグが必ず
-        // 揃うので、組み合わせを考えなくてよい。作り直すのは前の候補が
-        // 失敗したときだけなので、通常の経路では 1 回しか通らない。
-        let (flags, vm) = try_each(&steps, |flags| {
-            let cache = RandomXCache::new(flags, seed.as_bytes())
-                .map_err(|e| format!("cannot allocate the cache: {e}"))?;
-            create_vm(flags, Some(cache), None)
-        })?;
-        Ok(RandomXVerifier {
-            seed_height,
-            seed: *seed,
-            flags,
-            vm,
-        })
+        // キャッシュの参照は VM が持っているので、ここで手放してよい。
+        let (_, verifier) = SharedCache::with_verifier(seed, seed_height)?;
+        Ok(verifier)
     }
 
     /// この検証器が実際に用いているフラグ。
@@ -390,6 +385,131 @@ impl PowVerifier for RandomXVerifier {
     }
 }
 
+/// 検証のスレッドの間で共有できる、light モードのキャッシュ (256 MB)。
+///
+/// 1 つのシードエポックに対応する。**キャッシュを 1 本だけ建て、各
+/// スレッドは [`SharedCache::verifier`] で自分の VM を建てる。** 初期同期で
+/// ヘッダの PoW を並べて確かめるのに使う。スレッドごとにキャッシュを
+/// 建てると、256 MB と 0.5 秒ほどの初期化がスレッドの数だけかかる。
+///
+/// 安く複製できる。最後の複製 (と、それで建てた VM) が消えたときに
+/// キャッシュが解放される。
+///
+/// # `unsafe impl Send / Sync` が引き受けていること
+///
+/// [`SharedDataset`] と同じ形である。以下は `randomx-rs` 1.6.0 と、その中の
+/// tevador/RandomX を読んだうえで言えることである。
+///
+/// 1. **初期化が済めば、キャッシュは読むだけである。**
+///    `RandomXCache::new` は確保と初期化 (`randomx_init_cache`) を終えてから
+///    値を返す。その後に書き換える API は `randomx-rs` に無い
+///    (`RandomXVM::reinit_cache` が書き換えるのは VM の方である)。light の
+///    VM は建つときに (`setCache`) キャッシュの `memory`・`programs`・
+///    `reciprocalCache` を読み、JIT の符号は**自分の**コンパイラに書く。
+///    ハッシュの計算中はキャッシュの `memory` を読むだけである。
+/// 2. **RandomX 自身がこの使い方を想定している。** README は light モードを
+///    「256 MiB の共有メモリと、スレッドごとに 2 MiB」と書いている。
+/// 3. **解放は 1 回だけ、どのスレッドで起きてもよい。** `RandomXCache` は
+///    中身を `Arc` で持ち、最後の 1 つが消えたときに `randomx_release_cache`
+///    が 1 回だけ走る。
+/// 4. **VM は越えさせない。** [`RandomXVerifier`] は `Send` でも `Sync` でも
+///    ないままであり、このファイル末尾の `const _` がそれを固定している。
+#[derive(Clone)]
+pub struct SharedCache {
+    seed_height: u64,
+    seed: Hash,
+    /// キャッシュと VM のフラグ。建てるときに 1 度だけ確かめておく。
+    flags: RandomXFlag,
+    cache: RandomXCache,
+}
+
+// 上の説明の 1〜4 を引き受けている。
+#[allow(unsafe_code)]
+unsafe impl Send for SharedCache {}
+#[allow(unsafe_code)]
+unsafe impl Sync for SharedCache {}
+
+impl SharedCache {
+    /// キャッシュを建てる。引数の意味は [`RandomXVerifier::new`] と同じである。
+    pub fn new(seed: &Hash, seed_height: u64) -> Result<SharedCache, RandomXPowError> {
+        Ok(SharedCache::with_verifier(seed, seed_height)?.0)
+    }
+
+    /// キャッシュと、それを使う検証器を 1 つ建てる。
+    ///
+    /// 検証器は呼んだスレッドの上で使う。フラグを確かめるのに建てた VM を
+    /// そのまま渡すので、VM を 1 つ余分に建てずに済む。
+    pub fn with_verifier(
+        seed: &Hash,
+        seed_height: u64,
+    ) -> Result<(SharedCache, RandomXVerifier), RandomXPowError> {
+        // FLAG_FULL_MEM を足さないので light モードになる。
+        //
+        // 候補ごとにキャッシュから作り直す。light の VM はキャッシュの JIT の
+        // 有無に合わせて建つので、キャッシュと VM のフラグが必ず揃うように
+        // する。作り直すのは前の候補が失敗したときだけなので、通常の経路
+        // では 1 回しか通らない。
+        let (flags, (cache, vm)) = try_each(&flag_ladder(false), |flags| {
+            let cache = RandomXCache::new(flags, seed.as_bytes())
+                .map_err(|e| format!("cannot allocate the cache: {e}"))?;
+            let vm = create_vm(flags, Some(cache.clone()), None)?;
+            Ok((cache, vm))
+        })?;
+        let shared = SharedCache {
+            seed_height,
+            seed: *seed,
+            flags,
+            cache,
+        };
+        let verifier = shared.wrap(vm);
+        Ok((shared, verifier))
+    }
+
+    /// このキャッシュを使う検証器を 1 つ建てる。
+    ///
+    /// **呼んだスレッドの上で建ち、そこから動かない。** 検証のスレッドの
+    /// それぞれが自分の分を呼ぶ。キャッシュは建て直さない。VM の確保
+    /// (2 MB) だけなので安い。
+    pub fn verifier(&self) -> Result<RandomXVerifier, RandomXPowError> {
+        let vm = create_vm(self.flags, Some(self.cache.clone()), None)
+            .map_err(|e| RandomXPowError::Init(format!("cannot create a light-mode VM: {e}")))?;
+        Ok(self.wrap(vm))
+    }
+
+    fn wrap(&self, vm: RandomXVM) -> RandomXVerifier {
+        RandomXVerifier {
+            seed_height: self.seed_height,
+            seed: self.seed,
+            flags: self.flags,
+            vm,
+        }
+    }
+
+    /// 検証器が用いるフラグ。[`RandomXVerifier::flags`] と同じである。
+    pub fn flags(&self) -> RandomXFlag {
+        self.flags
+    }
+
+    /// このキャッシュが対応するシードのブロック高さ。
+    pub fn seed_height(&self) -> u64 {
+        self.seed_height
+    }
+
+    /// このキャッシュが用いているシード。
+    pub fn seed(&self) -> Hash {
+        self.seed
+    }
+}
+
+impl std::fmt::Debug for SharedCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedCache")
+            .field("seed_height", &self.seed_height)
+            .field("flags", &self.flags)
+            .finish()
+    }
+}
+
 // ━━━━━━━━ fast モード ━━━━━━━━
 
 /// データセットの大きさの目安 (バイト)。
@@ -428,8 +548,8 @@ fn with_large_pages(steps: &[RandomXFlag]) -> Vec<RandomXFlag> {
 ///
 /// # `unsafe impl Send / Sync` が引き受けていること
 ///
-/// この crate で `unsafe` と書いてあるのはこの 2 行だけである。
-/// 以下は `randomx-rs` 1.6.0 と、その中の tevador/RandomX を読んだうえで
+/// この crate で `unsafe` と書いてあるのは、この 2 行と [`SharedCache`] の
+/// 2 行だけである。以下は `randomx-rs` 1.6.0 と、その中の tevador/RandomX を読んだうえで
 /// 言えることである。
 ///
 /// 1. **初期化が済めば、データセットは読むだけである。**
@@ -756,6 +876,16 @@ const _: () = {
         Probe::<SharedDataset>::IS_SEND && Probe::<SharedDataset>::IS_SYNC,
         "SharedDataset can no longer cross threads"
     );
+    assert!(
+        !Probe::<RandomXCache>::IS_SEND && !Probe::<RandomXCache>::IS_SYNC,
+        "randomx-rs has made RandomXCache Send or Sync. The two \
+         `unsafe impl` lines on SharedCache are no longer needed: remove them."
+    );
+    // 検証のスレッドへ渡すのはこれである。
+    assert!(
+        Probe::<SharedCache>::IS_SEND && Probe::<SharedCache>::IS_SYNC,
+        "SharedCache can no longer cross threads"
+    );
 
     // 上から自動で従うが、本モジュールが公開しているのはこちらなので
     // 直接も確かめておく。
@@ -833,6 +963,51 @@ mod tests {
         let v = verifier();
         assert_eq!(v.check(&header(0, 0)), Err(RandomXPowError::ZeroDifficulty));
         assert!(!v.verify(&header(0, 0)));
+    }
+
+    #[test]
+    fn a_shared_cache_hashes_the_same_on_every_thread() {
+        // 1 本のキャッシュを 4 本のスレッドで使い、それぞれが自分の VM で
+        // 出したハッシュが、普通に建てた検証器のものと揃うこと。
+        let seed = hash::block_hash(b"orange genesis");
+        let expected: Vec<Hash> = (0..8)
+            .map(|n| verifier().hash_header(&header(n, 1)).unwrap())
+            .collect();
+        let shared = SharedCache::new(&seed, 0).unwrap();
+        assert_eq!(shared.seed(), seed);
+        assert_eq!(shared.flags(), verifier().flags());
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let shared = shared.clone();
+                    scope.spawn(move || {
+                        let v = shared.verifier().unwrap();
+                        (0..8)
+                            .map(|n| v.hash_header(&header(n, 1)).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert_eq!(worker.join().unwrap(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn a_shared_cache_judges_like_a_plain_verifier() {
+        let seed = hash::block_hash(b"orange genesis");
+        let (shared, first) = SharedCache::with_verifier(&seed, 0).unwrap();
+        let second = shared.verifier().unwrap();
+        for v in [&first, &second] {
+            assert_eq!(v.seed_height(), 0);
+            assert!(v.check(&header(0, 1)).unwrap());
+            assert!(!v.check(&header(0, u64::MAX)).unwrap());
+            assert_eq!(v.check(&header(0, 0)), Err(RandomXPowError::ZeroDifficulty));
+        }
+        // キャッシュの複製を全部手放しても、VM が参照を持っているので使える。
+        drop(shared);
+        assert!(second.verify(&header(0, 1)));
     }
 
     #[test]

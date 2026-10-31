@@ -96,4 +96,27 @@ try {
 if (first) throw new Error("the first address matched a signature by the second");
 console.log(`message: signed by the second address, ${said.bytes} bytes`);
 
+// Timestamp a file, as the Timestamp tab does: the page hashes the file with
+// sha256.js and the wasm records the hash. **It must be the same value
+// `sha256sum` prints**, and the output must carry exactly that.
+const { createHash } = await import("node:crypto");
+const { runInThisContext } = await import("node:vm");
+runInThisContext(
+  readFileSync("crates/oag-node/assets/sha256.js", "utf8") + ";globalThis.OAG_SHA256 = OAG_SHA256;",
+);
+const file = new Uint8Array(5 * 1024 * 1024 + 3);
+webcrypto.getRandomValues(file.subarray(0, 65536));
+const digest = await globalThis.OAG_SHA256.ofFile(new Blob([file]));
+if (digest !== createHash("sha256").update(file).digest("hex")) {
+  throw new Error("sha256.js does not agree with sha256sum");
+}
+const stamped = call({
+  cmd: "commit", network: "regtest", data: digest,
+  fee_rate: "50000000000", next_height: 500,
+  coins: [{ txid: "22".repeat(32), index: 0, amount: "100000000000000000",
+            height: 10, coinbase: true, address: mine }],
+});
+if (!stamped.hex.includes(digest)) throw new Error("the hash is not in the transaction");
+console.log(`timestamp: ${stamped.size} bytes / fee ${stamped.fee} OAG`);
+
 console.log("\neverything passed");

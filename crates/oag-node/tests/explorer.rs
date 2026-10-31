@@ -471,3 +471,28 @@ fn an_unknown_api_is_refused_in_json() {
     assert_eq!(json["error"], "no such endpoint");
     drop(service);
 }
+
+/// 頁は自分が配る JS しか動かさない。ファイルを確かめる JS は配られる。
+#[test]
+fn pages_run_only_the_explorers_own_scripts() {
+    let (_dir, service, runtime, addr) = start("csp");
+    let (head, _) = runtime.block_on(get_with_head(addr, "/"));
+    assert!(
+        head.contains("Content-Security-Policy: default-src 'self'; script-src 'self';"),
+        "{head}"
+    );
+    for path in ["/sha256.js", "/check.js"] {
+        let (head, body) = runtime.block_on(get_with_head(addr, path));
+        assert!(head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+        assert!(
+            head.contains("Content-Type: text/javascript"),
+            "{path}: {head}"
+        );
+        assert!(body.contains("\"use strict\";"), "{path}");
+    }
+    // コミットメント出力の無い取引には、確かめる欄を出さない。
+    let txid = genesis_txid(&service.handle(), &runtime);
+    let (_, body) = runtime.block_on(get(addr, &format!("/tx/{txid}")));
+    assert!(!body.contains("check a file"), "{body}");
+    drop(service);
+}
