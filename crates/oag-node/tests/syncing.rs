@@ -9,6 +9,7 @@ use oag_net::magic::magic_for;
 use oag_net::message::{VersionMessage, PROTOCOL_VERSION, SERVICE_NONE};
 use oag_net::transport::{Connection, Listener};
 use oag_node::accept_loop;
+use oag_node::node::NodeOptions;
 use oag_node::service::{MiningMode, NodeHandle, NodeService, SYNC_BEHIND};
 use oag_primitives::{Address, Hash, Network, SecretKey};
 use std::net::SocketAddr;
@@ -207,4 +208,52 @@ async fn many_headers_are_checked_in_waves_and_stop_at_the_first_bad_one() {
     let accepted = c.accept_headers(headers.clone()).await.unwrap();
     assert_eq!(accepted.new as u64, blocks);
     assert!(accepted.invalid.is_none(), "{:?}", accepted.invalid);
+}
+
+/// 軽量モードの「繋いだ先端」は、走査し終えた高さである (Issue #6)。
+///
+/// 軽量モードはブロックを繋がない。チェーンの先端を答えていたころは、
+/// ジェネシスのまま動かず、ピアの側が「本体が来ない」と誤って告げていた。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_light_node_reports_how_far_it_has_scanned() {
+    let blocks = 5;
+    let (_a_dir, a) = start("light-a");
+    let a = a.handle();
+    let payout = Lock::from_address(&Address::from_pubkey(
+        NETWORK,
+        &SecretKey::generate().public_key(),
+    ));
+    a.start_mining(payout.clone(), Some(blocks), MiningMode::light())
+        .await
+        .expect("mining starts");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while a.status().await.unwrap().height < blocks {
+        assert!(Instant::now() < deadline, "A did not mine {blocks} blocks");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let b_dir = TempDir::new("light-b");
+    let options = NodeOptions {
+        light: true,
+        watch: vec![payout],
+        ..NodeOptions::default()
+    };
+    let b = NodeService::start_with(NETWORK, &b_dir.0, options).expect("a light node starts");
+    let b = b.handle();
+    assert_eq!(b.tip_height().await.unwrap(), 0);
+
+    let headers = a
+        .headers_after(b.locator().await.unwrap(), Hash::ZERO)
+        .await
+        .unwrap();
+    b.accept_headers(headers.clone()).await.unwrap();
+    for header in &headers {
+        let block = a.block(header.hash()).await.unwrap().expect("A has it");
+        b.accept_block(block).await.unwrap();
+    }
+    assert_eq!(
+        b.tip_height().await.unwrap(),
+        blocks,
+        "a light node still reports the genesis as its tip"
+    );
 }

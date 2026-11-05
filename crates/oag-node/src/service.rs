@@ -595,6 +595,8 @@ impl NodeHandle {
     }
 
     /// 繋いだ先端の高さ。知っているだけのヘッダは含まない。
+    ///
+    /// 軽量モードはブロックを繋がないので、代わりに走査し終えた高さを返す。
     pub async fn tip_height(&self) -> Result<u64, String> {
         self.ask(Request::TipHeight).await
     }
@@ -1576,12 +1578,20 @@ impl Service {
                 let _ = reply.send(result);
             }
             Request::TipHeight(reply) => {
-                let result = self
-                    .node
-                    .chain()
-                    .tip()
-                    .map(|e| e.height())
-                    .map_err(|e| e.to_string());
+                // **軽量モードは走査したところまでを答える。** 軽量モードは
+                // ブロックを繋がないので、繋いだ先端はジェネシスのまま動か
+                // ない。そちらを答えると、ピアの側から見ていつまでも遅れて
+                // いることになり、本体を待つ間に「no block body」と誤って
+                // 告げていた (Issue #6)。
+                let result = match &self.light {
+                    Some(light) => Ok(light.tracker().scanned_to().unwrap_or(0)),
+                    None => self
+                        .node
+                        .chain()
+                        .tip()
+                        .map(|e| e.height())
+                        .map_err(|e| e.to_string()),
+                };
                 let _ = reply.send(result);
             }
             Request::Syncing(reply) => {
