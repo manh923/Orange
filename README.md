@@ -784,11 +784,9 @@ m / 44' / <coin_type>' / 0' / 0 / <index>
 > paper and keep it somewhere safe. Encryption will not save you if the
 > passphrase is weak.
 
-> **mainnet's coin_type 1033 is not final yet.** The SLIP-0044 registration
-> is **still under review**. If a different number is accepted, new versions
-> of the wallet **will keep reading the old path (1033)** and offer a way to
-> move the funds to the new one ([SPEC §6.6](docs/SPEC.md)). Your recovery
-> phrase stays valid either way, so keep it safe.
+> **mainnet's coin_type 1033 is final.** It is registered in SLIP-0044
+> ([SPEC §6.6](docs/SPEC.md)), so the path above will not change, and other
+> BIP44 wallets that add OAG will use the same one.
 
 To use a BIP39 passphrase, pass `--mnemonic-passphrase`. **A typo does not
 surface as an error.** A different passphrase simply produces a different wallet

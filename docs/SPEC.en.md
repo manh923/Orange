@@ -480,22 +480,24 @@ gap limit = 20
 | --- | ---: | --- |
 | testnet | 1 | reserved by SLIP-0044 for every coin's testnet; no registration needed |
 | regtest | 1 | as above |
-| mainnet | 1033 | applied for in SLIP-0044, **awaiting review** (see below) |
+| mainnet | 1033 | registered in SLIP-0044 (see below) |
 
-**1033 is not final.** If `satoshilabs/slips` accepts a different number, this
-value has to change, and **every mainnet key derived from the same recovery
-phrase changes with it**. From the user's point of view that is indistinguishable
-from the funds disappearing.
+**1033 is final.** `satoshilabs/slips` pull request #2062 was merged, and the
+registry now has the row `| 1033 | OAG | Orange |` (confirmed on 2026-11-19).
+The path is fixed at `m/44'/1033'/0'/0/<index>`, and every mainnet key made
+before that stays valid.
 
-The operational boundary is therefore:
+While the request was under review, these were the rules:
 
-- A wallet may derive mainnet keys. The path is fixed at
-  `m/44'/1033'/0'/0/<index>`
-- **Until the number is final, funds MUST NOT be placed on a mainnet address.**
-  The mainnet launch itself waits on the registration (§19)
-- If the number changes, what is discarded is the derivation path, not the
-  recovery phrase. The words stay valid and the funds move to addresses from the
-  new path
+- The original rule was to put no funds on a mainnet address until the number
+  was final. In practice, mainnet started on 2026-09-17 without waiting for the
+  registration, and funds went in (§19)
+- If a different number had been accepted, every mainnet key derived from the
+  same recovery phrase would have changed. The wallet would then have had to
+  keep reading the old (1033) path and offer a way to move funds to the new one
+  (MUST)
+
+Since 1033 was accepted as is, no such move is needed.
 
 #### Registering with SLIP-0044
 
@@ -509,16 +511,16 @@ The operational boundary is therefore:
    gaps.
 3. Open a pull request against `satoshilabs/slips` adding one row to the table in
    `slip-0044.md`. The table has three columns: `Coin type | Symbol | Coin`.
-   **Submitted: `satoshilabs/slips` pull request #2062. Awaiting review.**
+   **Merged as `satoshilabs/slips` pull request #2062.**
    (#2061, opened earlier for 1031, was closed because another request had
    claimed that number first)
 
-The number applied for is **1033**. It is a gap between 1032 and 1042, and
+The registered number is **1033**. It is a gap between 1032 and 1042, and
 neither `OAG` nor `Orange` is registered.
 
 ```text
 | 1032       | BTCR    | BTCR                              |
-| 1033       | OAG     | Orange                            |   ← the row added
+| 1033       | OAG     | Orange                            |   ← the row that was added
 | 1042       | MFID    | Moonfish ID                       |
 ```
 
@@ -528,17 +530,14 @@ earlier. The first application used 1031 (the lowest gap in the registry), but
 pull request #2059, filed six days earlier, claimed the same 1031 for NYEN, so
 it was changed to 1033. The 1032 in between is taken by BTCR.
 
-**This number is still not final.** The implementation puts 1033 in
-`COIN_TYPE_MAINNET` in `crates/oag-wallet/src/seed.rs`, and
-`coin_type(Network::Mainnet)` returns it. If the PR is merged, the constant
-stands as is. If a different number is accepted, that single constant changes and
-**every mainnet address created before that becomes invalid.** This is why the
-mainnet launch waits for the registration.
+The implementation puts 1033 in `COIN_TYPE_MAINNET` in
+`crates/oag-wallet/src/seed.rs`, and `coin_type(Network::Mainnet)` returns it.
+**This constant must never change.** Changing it would make every mainnet
+address created before that underivable.
 
-Neither the formal application procedure nor the review criteria are documented.
-**Since neither acceptance nor timing is guaranteed, this is built into the
-mainnet launch schedule.** testnet uses number 1 and does not depend on the
-registration at all.
+Neither the formal application procedure nor the review criteria were
+documented, and neither acceptance nor timing was guaranteed. testnet uses
+number 1 and does not depend on this registration.
 
 Choosing secp256k1 makes BIP32 **non-hardened derivation** available. That means
 an unlimited number of child addresses can be generated from an extended public
@@ -3423,10 +3422,9 @@ there misses the funds beyond it. **Evidence of use is found in the history**
 (which needs the index of §15).
 
 The path is the single line `m/44'/1033'/0'/0/<index>`; neither accounts nor a
-change branch fork off (§16.3). Only the index is scanned. While the number can
-still change (the SLIP-0044 item in §16.3), **hold the path as an array.**
-`/api/scan` takes an array of addresses, so the old and new paths can be mixed
-into one call.
+change branch fork off (§16.3). Only the index is scanned. The coin type is
+final in SLIP-0044 (the SLIP-0044 item in §16.3), so there will never be a
+second path.
 
 ---
 
@@ -3538,7 +3536,7 @@ The main choices and the reasons for them.
 | Chain-selection candidates | maintain a work-ordered set incrementally | a full scan is O(n) per block and O(n²) over an initial sync. At 100,000 blocks it matches the cost of writing to storage ([§10.6](#106-choosing-the-longest-chain)) |
 | Mnemonic | BIP39, 12 words (128 bits) | 128 bits matches secp256k1's real strength of 2^128. A longer seed is not stronger than the curve and only adds transcription errors ([§6.6](#66-hd-wallets)) |
 | Key derivation | BIP32 / BIP44 | avoids a state where a phrase written in the standard vocabulary is interpreted into different keys by another wallet. Keeps the path to hardware wallets open |
-| mainnet coin type | put the applied-for 1033 in the implementation, and hold the mainnet launch until registration completes | fixing the path early lets wallet testing proceed. Before funds are involved, a number change costs only the path |
+| mainnet coin type | put the applied-for 1033 in the implementation. The plan was to hold the mainnet launch until registration completed, but it launched without waiting. 1033 was registered as is in 2026-11 | fixing the path early lets wallet testing proceed ([§6.6](#66-hd-wallets)) |
 | Relative locktime | start enforcing with a soft fork at a fixed height, for version 2 and above | the semantics were already fixed in v1, so only enforcement needs adding. Version 1 is excluded because `sequence` had no meaning when those transactions were made (as in BIP68). Signalling (version bits) is not used because there are few miners and they can be reached directly ([§7.5](#75-sequence-relative-locktime)) |
 | Unknown output versions | keep anyone-can-spend, restrict versions to 0–31 | rejecting makes every version addition a hard fork. Restricting the range shrinks the dangerous surface without reducing soft-fork headroom ([§10.4](#104-handling-unknown-versions)) |
 | Merged mining | disabled in v1 | do not debug the standalone chain and the Monero integration at the same time. Only header space is reserved |
@@ -3581,17 +3579,10 @@ Items to be decided during implementation.
 
 ### Priority: high
 
-- [ ] **Register the mainnet SLIP-0044 coin type**
-      ([§6.6](#66-hd-wallets)). The BIP44-capable wallet that the application
-      presupposed is implemented, and
-      **`satoshilabs/slips` pull request #2062 has been submitted for number
-      1033 and is awaiting review.** The implementation carries 1033 and can
-      derive mainnet keys. testnet uses reserved number 1 and does not depend on
-      this registration. Neither acceptance nor timing is guaranteed.
-      **mainnet started on 2026-09-17 without waiting for the registration, and
-      it holds funds.** It uses 1033 while the request is pending. If another
-      number is accepted, the constant changes and the wallet must keep reading
-      the 1033 path so that funds can be moved ([§6.6](#66-hd-wallets))
+- [x] **Register the mainnet SLIP-0044 coin type**
+      ([§6.6](#66-hd-wallets)). `satoshilabs/slips` pull request #2062 was
+      merged with number 1033 (2026-11). The 1033 in the implementation stands,
+      and mainnet keys do not change
 
 ### Priority: low
 

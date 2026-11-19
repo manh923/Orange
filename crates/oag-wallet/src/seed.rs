@@ -39,13 +39,11 @@ const COIN_TYPE_TESTNET: u32 = 1;
 
 /// mainnet 用のコインタイプ番号。
 ///
-/// SLIP-0044 へ `| 1033 | OAG | Orange |` の 1 行を加える申請を提出済み
-/// である (SPEC の §6.6)。**取り込まれるまでは暫定である。**
+/// SLIP-0044 に `| 1033 | OAG | Orange |` として登録済みである
+/// (`satoshilabs/slips` #2062、SPEC の §6.6)。
 ///
-/// 審査で別の番号を割り当てられ、ここを書き換えた場合、**同じ控えから
-/// 導かれる mainnet の鍵はすべて変わる**。控えを書き写してあっても、
-/// 古い番号で作ったアドレスの資金は新しい経路からは見えない。
-/// 登録が確定するまで、mainnet のアドレスへ資金を入れてはならない。
+/// **書き換えてはならない。** 書き換えると、同じ控えから導かれる mainnet の
+/// 鍵がすべて変わり、それまでのアドレスの資金が新しい経路からは見えなくなる。
 const COIN_TYPE_MAINNET: u32 = 1033;
 
 /// 使う口座番号。いまは 1 つだけ。
@@ -89,8 +87,8 @@ impl From<Bip32Error> for SeedError {
 
 /// ネットワークのコインタイプ番号。
 ///
-/// testnet と regtest は SLIP-0044 の予約番号 1 を使う。mainnet は 1033 で
-/// あり、**この番号はまだ審査待ちである** (SPEC の §6.6)。
+/// testnet と regtest は SLIP-0044 の予約番号 1 を使う。mainnet は登録済みの
+/// 1033 である (SPEC の §6.6)。
 pub fn coin_type(network: Network) -> u32 {
     match network {
         Network::Testnet | Network::Regtest => COIN_TYPE_TESTNET,
@@ -155,11 +153,10 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_uses_the_number_filed_with_slip_0044() {
+    fn mainnet_uses_the_number_registered_with_slip_0044() {
         // **値そのものを書いて留める。** 定数を書き換えれば、同じ控えから
         // 導かれる mainnet の鍵がすべて変わる。うっかり変えたのであれば
-        // ここで落ちる。変えるのは SLIP-0044 が別の番号で受理したときだけ
-        // であり、そのときは既存の mainnet のアドレスを捨てることになる。
+        // ここで落ちる。1033 は SLIP-0044 に登録済みであり、変える理由は無い。
         assert_eq!(coin_type(Network::Mainnet), 1033);
     }
 
